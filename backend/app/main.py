@@ -27,7 +27,7 @@ cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ltts-frontend.onrender.com"],  # hard-coded
+    allow_origins=cors_origins,  # hard-coded
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
