@@ -15,7 +15,7 @@ from app.models import (
     TestSubmissionRequest, TestSubmissionResponse, TestQuestionResponse,
     TestAnalytics, UserPerformance, LeaderboardEntry, RecentActivity
 )
-from app.database import get_db_pool
+from app.database import get_supabase
 from app.auth import get_current_user, get_current_user_optional, UserResponse, get_password_hash
 import logging
 
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/tests", tags=["Test Management"])
 async def create_test(
     test_data: TestCreateRequest,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Create a new test from a question bank
@@ -183,7 +183,7 @@ async def get_tests(
     is_active: Optional[bool] = None,
     created_by_me: bool = Query(False, description="Show only tests created by current user"),
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get list of tests with analytics
@@ -285,7 +285,7 @@ async def get_tests(
 async def get_test_details(
     test_id: str,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get test details - accessible for both authenticated and anonymous users for public tests
@@ -380,7 +380,7 @@ async def update_test(
     test_id: str,
     update_data: TestUpdateRequest,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Update test settings (only by creator)
@@ -464,7 +464,7 @@ async def update_test(
 async def delete_test(
     test_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Delete a test (only by creator)
@@ -495,7 +495,7 @@ async def submit_test(
     test_id: str,
     submission: TestSubmissionRequest,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Submit test answers and calculate score
@@ -599,7 +599,7 @@ async def submit_test(
 async def get_test_analytics(
     test_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get detailed analytics for a test (creator only)
@@ -647,7 +647,7 @@ async def get_test_submissions(
     end_date: Optional[datetime] = Query(None),
     user: Optional[str] = Query(None, description="Filter by user name or email"),
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get all submissions for a test (creator only)
@@ -726,7 +726,7 @@ async def get_test_submissions(
 async def generate_share_link(
     test_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     try:
         async with pool.acquire() as conn:
@@ -776,7 +776,7 @@ async def generate_share_link(
 
 # New: Validate shared token and return test details
 @router.get("/share/{token}")
-async def get_shared_test(token: str, pool=Depends(get_db_pool)):
+async def get_shared_test(token: str, supabase=Depends(get_supabase)):
     try:
         async with pool.acquire() as conn:
             link = await conn.fetchrow("""
@@ -820,7 +820,7 @@ async def submit_via_share_token(
     token: str,
     submission: TestSubmissionRequest,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     try:
         async with pool.acquire() as conn:
@@ -956,7 +956,7 @@ async def get_test_leaderboard(
     test_id: str,
     limit: int = Query(50, ge=1, le=200),
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     try:
         async with pool.acquire() as conn:
@@ -1010,7 +1010,7 @@ async def get_test_leaderboard(
 async def export_test_results(
     test_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     try:
         async with pool.acquire() as conn:

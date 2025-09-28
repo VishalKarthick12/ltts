@@ -76,12 +76,13 @@ async def upload_question_bank(
             except Exception as e:
                 logger.error(f"Error batch inserting questions: {e}")
                 # Try individual inserts as fallback
+                questions_imported = 0
                 for question_data in questions_to_insert:
                     try:
                         supabase.table('questions').insert(question_data).execute()
+                        questions_imported += 1
                     except Exception as e2:
                         logger.error(f"Error inserting individual question: {e2}")
-                        questions_imported -= 1
         
         # Update question bank with file path (you might want to actually upload to Supabase Storage)
         file_path = f"uploads/{question_bank_id}/{file.filename}"
@@ -116,33 +117,32 @@ async def get_question_banks(
     Get list of question banks with question counts
     """
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT 
-                    qb.id, qb.name, qb.description, qb.file_path,
-                    qb.created_at, qb.updated_at, qb.created_by,
-                    COUNT(q.id) as question_count
-                FROM question_banks qb
-                LEFT JOIN questions q ON qb.id = q.question_bank_id
-                GROUP BY qb.id, qb.name, qb.description, qb.file_path,
-                         qb.created_at, qb.updated_at, qb.created_by
-                ORDER BY qb.created_at DESC
-                OFFSET $1 LIMIT $2
-            """, skip, limit)
+        # Get question banks with pagination
+        response = supabase.table('question_banks').select(
+            'id, name, description, file_path, created_at, updated_at, created_by'
+        ).order('created_at', desc=True).range(skip, skip + limit - 1).execute()
+        
+        question_banks = []
+        for row in response.data:
+            # Get question count for each bank
+            count_response = supabase.table('questions').select(
+                'id', count='exact'
+            ).eq('question_bank_id', row['id']).execute()
             
-            return [
-                QuestionBankResponse(
-                    id=str(row['id']),
-                    name=row['name'],
-                    description=row['description'],
-                    file_path=row['file_path'],
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
-                    created_by=str(row['created_by']),
-                    question_count=row['question_count']
-                )
-                for row in rows
-            ]
+            question_count = count_response.count if count_response.count else 0
+            
+            question_banks.append(QuestionBankResponse(
+                id=str(row['id']),
+                name=row['name'],
+                description=row['description'],
+                file_path=row['file_path'],
+                created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
+                updated_at=datetime.fromisoformat(row['updated_at'].replace('Z', '+00:00')) if isinstance(row['updated_at'], str) else row['updated_at'],
+                created_by=str(row['created_by']),
+                question_count=question_count
+            ))
+        
+        return question_banks
     except Exception as e:
         logger.error(f"Error fetching question banks: {e}")
         raise HTTPException(status_code=500, detail="Error fetching question banks")
@@ -150,38 +150,39 @@ async def get_question_banks(
 @router.get("/{question_bank_id}", response_model=QuestionBankResponse)
 async def get_question_bank(
     question_bank_id: str,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get specific question bank details
     """
     try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT 
-                    qb.id, qb.name, qb.description, qb.file_path,
-                    qb.created_at, qb.updated_at, qb.created_by,
-                    COUNT(q.id) as question_count
-                FROM question_banks qb
-                LEFT JOIN questions q ON qb.id = q.question_bank_id
-                WHERE qb.id = $1
-                GROUP BY qb.id, qb.name, qb.description, qb.file_path,
-                         qb.created_at, qb.updated_at, qb.created_by
-            """, question_bank_id)
-            
-            if not row:
-                raise HTTPException(status_code=404, detail="Question bank not found")
-            
-            return QuestionBankResponse(
-                id=str(row['id']),
-                name=row['name'],
-                description=row['description'],
-                file_path=row['file_path'],
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
-                created_by=str(row['created_by']),
-                question_count=row['question_count']
-            )
+        # Get question bank details
+        response = supabase.table('question_banks').select(
+            'id, name, description, file_path, created_at, updated_at, created_by'
+        ).eq('id', question_bank_id).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Question bank not found")
+        
+        row = response.data[0]
+        
+        # Get question count
+        count_response = supabase.table('questions').select(
+            'id', count='exact'
+        ).eq('question_bank_id', question_bank_id).execute()
+        
+        question_count = count_response.count if count_response.count else 0
+        
+        return QuestionBankResponse(
+            id=str(row['id']),
+            name=row['name'],
+            description=row['description'],
+            file_path=row['file_path'],
+            created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
+            updated_at=datetime.fromisoformat(row['updated_at'].replace('Z', '+00:00')) if isinstance(row['updated_at'], str) else row['updated_at'],
+            created_by=str(row['created_by']),
+            question_count=question_count
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -193,72 +194,65 @@ async def update_question_bank(
     question_bank_id: str,
     update: QuestionBankUpdate,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Update question bank metadata (name, description). Only the creator can edit.
     """
     try:
-        async with pool.acquire() as conn:
-            # Verify ownership
-            is_owner = await conn.fetchval(
-                """
-                SELECT EXISTS(SELECT 1 FROM question_banks WHERE id = $1 AND created_by = $2)
-                """,
-                question_bank_id, current_user.id
-            )
-            if not is_owner:
-                # Determine if it's not found or forbidden
-                exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM question_banks WHERE id = $1)", question_bank_id)
-                if not exists:
-                    raise HTTPException(status_code=404, detail="Question bank not found")
+        # Verify question bank exists and user owns it
+        existing_response = supabase.table('question_banks').select('*').eq(
+            'id', question_bank_id
+        ).eq('created_by', current_user.id).execute()
+        
+        if not existing_response.data:
+            # Check if question bank exists at all
+            check_response = supabase.table('question_banks').select('id').eq('id', question_bank_id).execute()
+            if not check_response.data:
+                raise HTTPException(status_code=404, detail="Question bank not found")
+            else:
                 raise HTTPException(status_code=403, detail="Not authorized to edit this question bank")
+        
+        # Prepare update data
+        update_data = {}
+        if update.name is not None:
+            update_data['name'] = update.name
+        if update.description is not None:
+            update_data['description'] = update.description
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No changes provided")
+        
+        # Add updated timestamp
+        update_data['updated_at'] = datetime.now().isoformat()
+        
+        # Update the question bank
+        update_response = supabase.table('question_banks').update(update_data).eq(
+            'id', question_bank_id
+        ).eq('created_by', current_user.id).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update question bank")
+        
+        row = update_response.data[0]
+        
+        # Get question count for response
+        count_response = supabase.table('questions').select(
+            'id', count='exact'
+        ).eq('question_bank_id', question_bank_id).execute()
+        
+        question_count = count_response.count if count_response.count else 0
 
-            updates = []
-            params = []
-            idx = 0
-            if update.name is not None:
-                idx += 1
-                updates.append(f"name = ${idx}")
-                params.append(update.name)
-            if update.description is not None:
-                idx += 1
-                updates.append(f"description = ${idx}")
-                params.append(update.description)
-            if not updates:
-                raise HTTPException(status_code=400, detail="No changes provided")
-
-            # updated_at
-            from datetime import datetime
-            idx += 1
-            updates.append(f"updated_at = ${idx}")
-            params.append(datetime.utcnow())
-            idx += 1
-            params.append(question_bank_id)
-
-            row = await conn.fetchrow(
-                f"""
-                UPDATE question_banks
-                SET {', '.join(updates)}
-                WHERE id = ${idx}
-                RETURNING id, name, description, file_path, created_at, updated_at, created_by
-                """,
-                *params
-            )
-
-            # Fetch question count for response
-            count = await conn.fetchval("SELECT COUNT(*) FROM questions WHERE question_bank_id = $1", question_bank_id)
-
-            return QuestionBankResponse(
-                id=str(row['id']),
-                name=row['name'],
-                description=row['description'],
-                file_path=row['file_path'],
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
-                created_by=str(row['created_by']),
-                question_count=count
-            )
+        return QuestionBankResponse(
+            id=str(row['id']),
+            name=row['name'],
+            description=row['description'],
+            file_path=row['file_path'],
+            created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
+            updated_at=datetime.fromisoformat(row['updated_at'].replace('Z', '+00:00')) if isinstance(row['updated_at'], str) else row['updated_at'],
+            created_by=str(row['created_by']),
+            question_count=question_count
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -272,54 +266,39 @@ async def get_questions(
     limit: int = 100,
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get questions from a specific question bank
     """
     try:
-        # Build dynamic query
-        conditions = ["question_bank_id = $1"]
-        params = [question_bank_id]
-        param_count = 1
+        # Build Supabase query
+        query = supabase.table('questions').select(
+            'id, question_bank_id, question_text, question_type, options, correct_answer, difficulty_level, category, created_at'
+        ).eq('question_bank_id', question_bank_id)
         
         if category:
-            param_count += 1
-            conditions.append(f"category = ${param_count}")
-            params.append(category)
+            query = query.eq('category', category)
         
         if difficulty:
-            param_count += 1
-            conditions.append(f"difficulty_level = ${param_count}")
-            params.append(difficulty)
+            query = query.eq('difficulty_level', difficulty)
         
-        query = f"""
-            SELECT id, question_bank_id, question_text, question_type,
-                   options, correct_answer, difficulty_level, category, created_at
-            FROM questions
-            WHERE {' AND '.join(conditions)}
-            ORDER BY created_at DESC
-            OFFSET ${param_count + 1} LIMIT ${param_count + 2}
-        """
-        params.extend([skip, limit])
+        response = query.order('created_at', desc=True).range(skip, skip + limit - 1).execute()
         
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(query, *params)
-            
-            return [
-                QuestionResponse(
-                    id=str(row['id']),
-                    question_bank_id=str(row['question_bank_id']),
-                    question_text=row['question_text'],
-                    question_type=row['question_type'],
-                    options=row['options'],
-                    correct_answer=row['correct_answer'],
-                    difficulty_level=row['difficulty_level'],
-                    category=row['category'],
-                    created_at=row['created_at']
-                )
-                for row in rows
-            ]
+        return [
+            QuestionResponse(
+                id=str(row['id']),
+                question_bank_id=str(row['question_bank_id']),
+                question_text=row['question_text'],
+                question_type=row['question_type'],
+                options=row['options'],
+                correct_answer=row['correct_answer'],
+                difficulty_level=row['difficulty_level'],
+                category=row['category'],
+                created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at']
+            )
+            for row in response.data
+        ]
     except Exception as e:
         logger.error(f"Error fetching questions: {e}")
         raise HTTPException(status_code=500, detail="Error fetching questions")
@@ -327,29 +306,38 @@ async def get_questions(
 @router.delete("/{question_bank_id}")
 async def delete_question_bank(
     question_bank_id: str,
-    pool=Depends(get_db_pool)
+    current_user: UserResponse = Depends(get_current_user),
+    supabase=Depends(get_supabase)
 ):
     """
     Delete a question bank and all its questions
     """
     try:
-        async with pool.acquire() as conn:
-            # Check if question bank exists
-            exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM question_banks WHERE id = $1)",
-                question_bank_id
-            )
-            
-            if not exists:
+        # Verify question bank exists and user owns it
+        existing_response = supabase.table('question_banks').select('*').eq(
+            'id', question_bank_id
+        ).eq('created_by', current_user.id).execute()
+        
+        if not existing_response.data:
+            # Check if question bank exists at all
+            check_response = supabase.table('question_banks').select('id').eq('id', question_bank_id).execute()
+            if not check_response.data:
                 raise HTTPException(status_code=404, detail="Question bank not found")
-            
-            # Delete questions first (due to foreign key constraint)
-            await conn.execute("DELETE FROM questions WHERE question_bank_id = $1", question_bank_id)
-            
-            # Delete question bank
-            await conn.execute("DELETE FROM question_banks WHERE id = $1", question_bank_id)
-            
-            return {"message": "Question bank deleted successfully"}
+            else:
+                raise HTTPException(status_code=403, detail="Not authorized to delete this question bank")
+        
+        # Delete questions first (foreign key constraint)
+        supabase.table('questions').delete().eq('question_bank_id', question_bank_id).execute()
+        
+        # Delete question bank
+        delete_response = supabase.table('question_banks').delete().eq(
+            'id', question_bank_id
+        ).eq('created_by', current_user.id).execute()
+        
+        if not delete_response.data:
+            raise HTTPException(status_code=500, detail="Failed to delete question bank")
+        
+        return {"message": "Question bank deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:

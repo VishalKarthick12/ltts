@@ -14,7 +14,7 @@ from app.models import (
     SaveAnswerRequest, SaveAnswerResponse, TestDetailsResponse,
     TestSubmissionRequest, TestSubmissionResponse, TestQuestionResponse
 )
-from app.database import get_db_pool
+from app.database import get_supabase
 from app.auth import get_current_user_optional, UserResponse, get_password_hash
 import logging
 
@@ -27,7 +27,7 @@ async def start_test_session(
     session_data: TestSessionStart,
     request: Request,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Start a new test session with timer and session tracking
@@ -176,7 +176,7 @@ async def get_test_questions(
     test_id: str,
     session_token: str,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get test questions for an active session
@@ -243,7 +243,7 @@ async def get_test_questions(
 @router.get("/session/{session_token}/status", response_model=TestSessionStatus)
 async def get_session_status(
     session_token: str,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get current session status including time remaining
@@ -288,7 +288,7 @@ async def get_session_status(
 async def save_answer(
     session_token: str,
     answer_data: SaveAnswerRequest,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Save/autosave an answer during test taking
@@ -340,7 +340,7 @@ async def save_answer(
 async def submit_test_session(
     session_token: str,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Submit a test session and calculate final score
@@ -477,7 +477,7 @@ async def submit_test_session(
 async def get_submission_result(
     submission_id: str,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get detailed submission results
@@ -544,7 +544,7 @@ async def get_submission_result(
 async def get_result_by_email(
     test_id: str,
     participant_email: str,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get the latest submission result for a participant by email (for shared tests)
@@ -595,7 +595,7 @@ async def get_result_by_email(
 @router.get("/user/attempts", response_model=List[TestSubmissionResponse])
 async def get_user_attempts(
     current_user: UserResponse = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get all test attempts for the current user
@@ -637,7 +637,7 @@ async def get_user_attempts(
 @router.delete("/session/{session_token}")
 async def cancel_test_session(
     session_token: str,
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Cancel an active test session

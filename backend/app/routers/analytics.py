@@ -10,7 +10,7 @@ from app.models import (
     DashboardStats, LeaderboardEntry, RecentActivity, UserPerformance,
     TestAnalytics, QuestionBankResponse, TestResponse
 )
-from app.database import get_db_pool
+from app.database import get_supabase
 from app.auth import get_current_user, UserResponse
 import logging
 
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api/analytics", tags=["Analytics & Reporting"])
 @router.get("/dashboard", response_model=DashboardStats)
 async def get_dashboard_stats(
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get comprehensive dashboard statistics
@@ -173,7 +173,7 @@ async def get_dashboard_stats(
 async def get_leaderboard(
     limit: int = Query(20, ge=1, le=100),
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get user leaderboard
@@ -208,7 +208,7 @@ async def get_recent_activity(
     limit: int = Query(20, ge=1, le=100),
     test_id: Optional[str] = None,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get recent test activity
@@ -266,7 +266,7 @@ async def get_recent_activity(
 @router.get("/user-performance", response_model=List[UserPerformance])
 async def get_user_performance(
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get current user's performance across all tests

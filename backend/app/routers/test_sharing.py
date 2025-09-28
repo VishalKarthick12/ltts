@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from app.models import TestResponse
-from app.database import get_db_pool
+from app.database import get_supabase
 from app.auth import get_current_user, get_current_user_optional, UserResponse
 from pydantic import BaseModel, EmailStr, Field
 import logging
@@ -71,7 +71,7 @@ class SharedTestResponse(BaseModel):
 async def create_test_invites(
     invite_data: CreateInviteRequest,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Create invites for specific users to take a test
@@ -140,7 +140,7 @@ async def create_test_invites(
 async def create_public_link(
     link_data: CreatePublicLinkRequest,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Create a public shareable link for a test
@@ -199,7 +199,7 @@ async def create_public_link(
 async def get_invite_details(
     invite_token: str,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get test details from invite token
@@ -254,7 +254,7 @@ async def get_public_test(
     link_token: str,
     request: Request,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Access test via public link
@@ -308,7 +308,7 @@ async def get_public_test(
 @router.get("/my-shared-tests", response_model=List[SharedTestResponse])
 async def get_my_shared_tests(
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get tests shared with the current user
@@ -348,7 +348,7 @@ async def get_my_shared_tests(
 async def accept_invite(
     invite_token: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Accept a test invite
@@ -379,7 +379,7 @@ async def accept_invite(
 async def get_test_sharing_info(
     test_id: str,
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get sharing information for a test (invites and public links)
