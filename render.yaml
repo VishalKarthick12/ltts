@@ -1,0 +1,94 @@
+# =============================================================================
+# Render Configuration for LTTS - Question Bank & Test Management System
+# Full-stack deployment with Next.js frontend and FastAPI backend
+# =============================================================================
+
+services:
+  # FastAPI Backend Service
+  - type: web
+    name: ltts-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    plan: starter  # Upgrade to standard/pro for production
+    rootDir: ./backend
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: HOST  
+        value: 0.0.0.0
+      - key: ENVIRONMENT
+        value: production
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ltts-postgres
+          property: connectionString
+      # Add these in Render dashboard (keep secrets secure):
+      # - SUPABASE_URL
+      # - SUPABASE_SERVICE_ROLE_KEY  
+      # - SUPABASE_ANON_KEY
+      # - JWT_SECRET_KEY
+      # - CORS_ORIGINS
+
+  # Next.js Frontend Service  
+  - type: web
+    name: ltts-frontend
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    plan: starter  # Upgrade to standard/pro for production
+    rootDir: ./frontend
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      # Add these in Render dashboard:
+      # - NEXT_PUBLIC_SUPABASE_URL
+      # - NEXT_PUBLIC_SUPABASE_ANON_KEY
+      # - NEXT_PUBLIC_API_URL (set to backend service URL)
+
+  # Optional: Static file service for uploads (if needed)
+  # - type: web
+  #   name: ltts-static
+  #   runtime: static
+  #   staticPublishPath: ./uploads
+  #   buildCommand: echo "Static files service"
+  #   headers:
+  #     - path: /*
+  #       name: Cache-Control
+  #       value: public, max-age=86400
+
+# Optional: Database (if not using Supabase PostgreSQL)
+# databases:
+#   - name: ltts-postgres
+#     plan: starter
+#     databaseName: ltts
+#     user: ltts_user
+
+# =============================================================================
+# Manual Setup Steps for Render Dashboard:
+# 
+# 1. Create services from this render.yaml
+# 2. Add environment variables in Render dashboard (not in this file for security)
+# 3. Connect your GitHub repository 
+# 4. Set up custom domains (optional)
+# 5. Configure health checks and monitoring
+# 
+# Backend Environment Variables to add in Render:
+# - SUPABASE_URL=https://your-project-id.supabase.co
+# - SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+# - SUPABASE_ANON_KEY=your_anon_key  
+# - JWT_SECRET_KEY=your_long_secret_key
+# - CORS_ORIGINS=https://your-frontend.onrender.com
+#
+# Frontend Environment Variables to add in Render:
+# - NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
+# - NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_key
+# - NEXT_PUBLIC_API_URL=https://your-backend.onrender.com
+# =============================================================================

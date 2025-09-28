@@ -1,0 +1,11 @@
+question,type,options,correct_answer,difficulty,category
+What is 2 + 2?,multiple_choice,2|3|4|5,4,easy,math
+What is the capital of France?,multiple_choice,London|Berlin|Paris|Madrid,Paris,medium,geography
+Python is a programming language,true_false,,True,easy,programming
+What is the largest planet in our solar system?,short_answer,,Jupiter,medium,astronomy
+Write a short essay about climate change,essay,,Sample essay about climate change,hard,environment
+What is 10 * 5?,multiple_choice,45|50|55|60,50,easy,math
+HTML stands for HyperText Markup Language,true_false,,True,easy,web development
+What year did World War II end?,short_answer,,1945,medium,history
+Name three types of renewable energy,short_answer,,Solar wind hydro,medium,environment
+What is the chemical symbol for gold?,short_answer,,Au,hard,chemistry

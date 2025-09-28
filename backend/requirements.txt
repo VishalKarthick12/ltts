@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+supabase
+pydantic
+pydantic-settings
+asyncpg
+pandas
+openpyxl
+xlrd
+aiofiles
+python-jose[cryptography]
+passlib[bcrypt]
