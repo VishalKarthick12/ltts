@@ -52,10 +52,9 @@ PORT=8000
 HOST=0.0.0.0
 ENVIRONMENT=production
 
-# Database & Supabase
-DATABASE_URL=postgresql://postgres:[PASSWORD]@db.[PROJECT-ID].supabase.co:5432/postgres
+# Supabase Configuration (No DATABASE_URL needed)
 SUPABASE_URL=https://[PROJECT-ID].supabase.co
-SUPABASE_SERVICE_ROLE_KEY=[YOUR-SERVICE-ROLE-KEY]
+SUPABASE_SERVICE_KEY=[YOUR-SERVICE-ROLE-KEY]
 SUPABASE_ANON_KEY=[YOUR-ANON-KEY]
 
 # JWT Configuration  

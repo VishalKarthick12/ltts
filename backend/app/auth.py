@@ -12,7 +12,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 import bcrypt
-from app.database import get_db_pool
+from app.database import get_supabase
 
 # Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here-change-in-production-make-it-long-and-random")
@@ -67,78 +67,90 @@ def get_password_hash(password: str) -> str:
     return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 async def get_user_by_email(email: str) -> Optional[UserInDB]:
-    """Get user from database by email"""
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, name, email, password_hash, created_at, is_active
-            FROM users 
-            WHERE email = $1 AND is_active = TRUE
-        """, email)
+    """Get user from database by email using Supabase"""
+    try:
+        client = get_supabase()
+        response = client.table('users').select('id, name, email, password_hash, created_at, is_active').eq('email', email).eq('is_active', True).execute()
         
-        if row:
+        if response.data and len(response.data) > 0:
+            row = response.data[0]
             return UserInDB(
                 id=str(row['id']),
                 name=row['name'],
                 email=row['email'],
                 password_hash=row['password_hash'],
-                created_at=row['created_at'],
+                created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
                 is_active=row['is_active']
             )
+    except Exception as e:
+        print(f"Error getting user by email: {e}")
     return None
 
 async def get_user_by_id(user_id: str) -> Optional[UserInDB]:
-    """Get user from database by ID"""
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, name, email, password_hash, created_at, is_active
-            FROM users 
-            WHERE id = $1 AND is_active = TRUE
-        """, user_id)
+    """Get user from database by ID using Supabase"""
+    try:
+        client = get_supabase()
+        response = client.table('users').select('id, name, email, password_hash, created_at, is_active').eq('id', user_id).eq('is_active', True).execute()
         
-        if row:
+        if response.data and len(response.data) > 0:
+            row = response.data[0]
             return UserInDB(
                 id=str(row['id']),
                 name=row['name'],
                 email=row['email'],
                 password_hash=row['password_hash'],
-                created_at=row['created_at'],
+                created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
                 is_active=row['is_active']
             )
+    except Exception as e:
+        print(f"Error getting user by ID: {e}")
     return None
 
 async def create_user(user_data: UserCreate) -> UserInDB:
-    """Create a new user in the database"""
+    """Create a new user in the database using Supabase"""
     # Hash the password
     password_hash = get_password_hash(user_data.password)
     
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
+    try:
+        client = get_supabase()
+        
         # Check if user already exists
-        existing_user = await conn.fetchrow(
-            "SELECT id FROM users WHERE email = $1", user_data.email
-        )
-        if existing_user:
+        existing_response = client.table('users').select('id').eq('email', user_data.email).execute()
+        if existing_response.data and len(existing_response.data) > 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
             )
         
         # Create new user
-        row = await conn.fetchrow("""
-            INSERT INTO users (name, email, password_hash)
-            VALUES ($1, $2, $3)
-            RETURNING id, name, email, password_hash, created_at, is_active
-        """, user_data.name, user_data.email, password_hash)
+        insert_response = client.table('users').insert({
+            'name': user_data.name,
+            'email': user_data.email,
+            'password_hash': password_hash
+        }).execute()
         
-        return UserInDB(
-            id=str(row['id']),
-            name=row['name'],
-            email=row['email'],
-            password_hash=row['password_hash'],
-            created_at=row['created_at'],
-            is_active=row['is_active']
+        if insert_response.data and len(insert_response.data) > 0:
+            row = insert_response.data[0]
+            return UserInDB(
+                id=str(row['id']),
+                name=row['name'],
+                email=row['email'],
+                password_hash=row['password_hash'],
+                created_at=datetime.fromisoformat(row['created_at'].replace('Z', '+00:00')) if isinstance(row['created_at'], str) else row['created_at'],
+                is_active=row['is_active']
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creating user: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user"
         )
 
 async def authenticate_user(email: str, password: str) -> Optional[UserInDB]:

@@ -235,3 +235,4 @@ class FileProcessorService:
 
 # Global instance
 file_processor = FileProcessorService()
+

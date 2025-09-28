@@ -80,3 +80,4 @@ The scaffolding is complete and ready for you to add:
 - `README.md` - Complete project overview
 - `docs/database-schema.md` - Database design
 - API docs available at: http://localhost:8000/docs (when backend is running)
+

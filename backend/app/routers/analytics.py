@@ -301,3 +301,4 @@ async def get_user_performance(
     except Exception as e:
         logger.error(f"Error fetching user performance: {e}")
         raise HTTPException(status_code=500, detail="Error fetching user performance")
+

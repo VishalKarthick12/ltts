@@ -131,3 +131,4 @@ CREATE POLICY "Users can view own files" ON storage.objects
 2. Ensure RLS policies are properly configured
 3. Create the storage bucket for file uploads
 4. Update your application's TypeScript types to match the schema
+

@@ -33,9 +33,8 @@ def main():
     
     # Validate required environment variables
     required_vars = [
-        "DATABASE_URL",
         "SUPABASE_URL", 
-        "SUPABASE_SERVICE_ROLE_KEY",
+        "SUPABASE_SERVICE_KEY",
         "JWT_SECRET_KEY"
     ]
     
@@ -56,8 +55,8 @@ def main():
     logger.info(f"Environment: {environment}")
     logger.info(f"Host: {host}")
     logger.info(f"Port: {port}")
-    logger.info(f"Database: {os.getenv('DATABASE_URL', '').split('@')[1] if '@' in os.getenv('DATABASE_URL', '') else 'Not configured'}")
-    logger.info(f"Supabase: {os.getenv('SUPABASE_URL', 'Not configured')}")
+    logger.info(f"Supabase URL: {os.getenv('SUPABASE_URL', 'Not configured')}")
+    logger.info(f"Supabase Key: {'***' + (os.getenv('SUPABASE_SERVICE_KEY', '')[-8:] if os.getenv('SUPABASE_SERVICE_KEY') else 'Not configured')}")
     logger.info("="*60)
     
     # Production configuration

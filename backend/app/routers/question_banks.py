@@ -12,7 +12,7 @@ from app.models import (
     QuestionBankCreate, QuestionBankResponse, QuestionResponse,
     FileUploadResponse, ErrorResponse, QuestionBankUpdate
 )
-from app.database import get_db_pool, get_supabase
+from app.database import get_supabase, get_supabase_manager
 from app.services.file_processor import file_processor
 from app.auth import get_current_user, get_current_user_optional, UserResponse
 import logging
@@ -26,7 +26,6 @@ async def upload_question_bank(
     name: str = Form(...),
     description: Optional[str] = Form(None),
     current_user: UserResponse = Depends(get_current_user),
-    pool=Depends(get_db_pool),
     supabase=Depends(get_supabase)
 ):
     """
@@ -37,39 +36,52 @@ async def upload_question_bank(
         question_bank_id = str(uuid.uuid4())
         
         # Create question bank record first
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO question_banks (id, name, description, file_path, created_by)
-                VALUES ($1, $2, $3, $4, $5)
-            """, question_bank_id, name, description, f"uploads/{file.filename}", current_user.id)
+        supabase.table('question_banks').insert({
+            'id': question_bank_id,
+            'name': name,
+            'description': description,
+            'file_path': f"uploads/{file.filename}",
+            'created_by': current_user.id
+        }).execute()
         
         # Process the uploaded file
         questions = await file_processor.process_file(file, question_bank_id)
         
-        # Insert questions into database
+        # Insert questions into database using Supabase
         questions_imported = 0
-        async with pool.acquire() as conn:
-            for question in questions:
-                try:
-                    await conn.execute("""
-                        INSERT INTO questions (
-                            id, question_bank_id, question_text, question_type,
-                            options, correct_answer, difficulty_level, category
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    """, 
-                        str(uuid.uuid4()),
-                        question.question_bank_id,
-                        question.question_text,
-                        question.question_type.value,
-                        question.options,
-                        question.correct_answer,
-                        question.difficulty_level.value if question.difficulty_level else None,
-                        question.category
-                    )
-                    questions_imported += 1
-                except Exception as e:
-                    logger.error(f"Error inserting question: {e}")
-                    continue
+        questions_to_insert = []
+        
+        for question in questions:
+            try:
+                question_data = {
+                    'id': str(uuid.uuid4()),
+                    'question_bank_id': question.question_bank_id,
+                    'question_text': question.question_text,
+                    'question_type': question.question_type.value,
+                    'options': question.options,
+                    'correct_answer': question.correct_answer,
+                    'difficulty_level': question.difficulty_level.value if question.difficulty_level else None,
+                    'category': question.category
+                }
+                questions_to_insert.append(question_data)
+                questions_imported += 1
+            except Exception as e:
+                logger.error(f"Error preparing question: {e}")
+                continue
+        
+        # Batch insert questions
+        if questions_to_insert:
+            try:
+                supabase.table('questions').insert(questions_to_insert).execute()
+            except Exception as e:
+                logger.error(f"Error batch inserting questions: {e}")
+                # Try individual inserts as fallback
+                for question_data in questions_to_insert:
+                    try:
+                        supabase.table('questions').insert(question_data).execute()
+                    except Exception as e2:
+                        logger.error(f"Error inserting individual question: {e2}")
+                        questions_imported -= 1
         
         # Update question bank with file path (you might want to actually upload to Supabase Storage)
         file_path = f"uploads/{question_bank_id}/{file.filename}"
@@ -88,8 +100,7 @@ async def upload_question_bank(
         logger.error(f"Error uploading question bank: {e}")
         # Clean up question bank if it was created
         try:
-            async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM question_banks WHERE id = $1", question_bank_id)
+            supabase.table('question_banks').delete().eq('id', question_bank_id).execute()
         except:
             pass
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
@@ -99,7 +110,7 @@ async def get_question_banks(
     skip: int = 0,
     limit: int = 100,
     current_user: Optional[UserResponse] = Depends(get_current_user_optional),
-    pool=Depends(get_db_pool)
+    supabase=Depends(get_supabase)
 ):
     """
     Get list of question banks with question counts

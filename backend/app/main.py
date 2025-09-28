@@ -5,7 +5,7 @@ import os
 import logging
 from datetime import datetime
 
-from app.database import check_database_health, db_manager
+from app.database import check_database_health, supabase_manager
 from app.models import HealthCheck
 from app.routers import question_banks, auth, tests, analytics, test_taking, test_sharing
 
@@ -56,7 +56,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean up database connections on shutdown"""
-    await db_manager.close()
+    await supabase_manager.close()
     logger.info("Database connections closed")
 
 @app.get("/")

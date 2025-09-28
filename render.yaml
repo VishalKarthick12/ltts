@@ -23,16 +23,12 @@ services:
         value: production
       - key: PYTHON_VERSION
         value: 3.11
-      - key: DATABASE_URL
-        fromDatabase:
-          name: ltts-postgres
-          property: connectionString
       # Add these in Render dashboard (keep secrets secure):
-      # - SUPABASE_URL
-      # - SUPABASE_SERVICE_ROLE_KEY  
-      # - SUPABASE_ANON_KEY
-      # - JWT_SECRET_KEY
-      # - CORS_ORIGINS
+      # - SUPABASE_URL (https://your-project-id.supabase.co)
+      # - SUPABASE_SERVICE_KEY (your service role key)
+      # - SUPABASE_ANON_KEY (your anon key)  
+      # - JWT_SECRET_KEY (generate a strong secret)
+      # - CORS_ORIGINS (https://your-frontend.onrender.com)
 
   # Next.js Frontend Service  
   - type: web
