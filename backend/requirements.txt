@@ -12,3 +12,4 @@ xlrd
 aiofiles
 python-jose[cryptography]
 passlib[bcrypt]
+email-validator
