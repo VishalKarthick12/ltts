@@ -24,13 +24,15 @@ app = FastAPI(
 
 # Configure CORS with environment awareness
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ltts-frontend.onrender.com"],  # Configurable origins from env
+    allow_origins=["https://ltts-frontend.onrender.com"],  # hard-coded
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Include routers
 app.include_router(auth.router)
