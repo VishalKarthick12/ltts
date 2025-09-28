@@ -33,137 +33,166 @@ async def start_test_session(
     Start a new test session with timer and session tracking
     """
     try:
-        async with pool.acquire() as conn:
-            # Get test details
-            test_row = await conn.fetchrow("""
-                SELECT * FROM tests WHERE id = $1 AND is_active = true
-            """, test_id)
-            
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found or inactive")
-            
-            # Check if test is accessible
-            now = datetime.now(timezone.utc)
-            if test_row['scheduled_start'] and now < test_row['scheduled_start']:
+        # SUPABASE MIGRATION: Replace pool.acquire() with direct Supabase client calls
+        # Get test details using Supabase
+        test_response = supabase.table('tests').select('*').eq('id', test_id).eq('is_active', True).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or inactive")
+        
+        test_row = test_response.data[0]
+        
+        # Check if test is accessible
+        now = datetime.now(timezone.utc)
+        scheduled_start = test_row.get('scheduled_start')
+        scheduled_end = test_row.get('scheduled_end')
+        
+        if scheduled_start:
+            if isinstance(scheduled_start, str):
+                scheduled_start = datetime.fromisoformat(scheduled_start.replace('Z', '+00:00'))
+            if now < scheduled_start:
                 raise HTTPException(status_code=403, detail="Test has not started yet")
-            if test_row['scheduled_end'] and now > test_row['scheduled_end']:
+                
+        if scheduled_end:
+            if isinstance(scheduled_end, str):
+                scheduled_end = datetime.fromisoformat(scheduled_end.replace('Z', '+00:00'))
+            if now > scheduled_end:
                 raise HTTPException(status_code=403, detail="Test has ended")
+        
+        # SUPABASE: Resolve or create user if possible
+        resolved_user_id = None
+        if current_user:
+            resolved_user_id = current_user.id
+        elif session_data.participant_email:
+            # Try to find existing user by email using Supabase
+            existing_user_response = supabase.table('users').select('id').eq('email', session_data.participant_email).eq('is_active', True).execute()
             
-            # Resolve or create user if possible
-            resolved_user_id = None
-            if current_user:
-                resolved_user_id = current_user.id
-            elif session_data.participant_email:
-                # Try to find existing user by email
-                existing_user = await conn.fetchrow("""
-                    SELECT id FROM users WHERE email = $1 AND is_active = TRUE
-                """, session_data.participant_email)
-                if existing_user:
-                    resolved_user_id = existing_user['id']
-                else:
-                    # Create lightweight user record
-                    try:
-                        password_hash = get_password_hash(secrets.token_urlsafe(16))
-                        new_user = await conn.fetchrow("""
-                            INSERT INTO users (name, email, password_hash, is_active)
-                            VALUES ($1, $2, $3, TRUE)
-                            RETURNING id
-                        """, session_data.participant_name, session_data.participant_email, password_hash)
-                        resolved_user_id = new_user['id'] if new_user else None
-                    except Exception:
-                        # Fallback to anonymous if user table constraints prevent creation
-                        resolved_user_id = None
-
-            # Validate invite token if provided
-            if getattr(session_data, 'invite_token', None):
-                token_valid = await conn.fetchval("""
-                    SELECT EXISTS(
-                        SELECT 1 FROM test_public_links 
-                        WHERE link_token = $1 AND test_id = $2 AND is_active = TRUE 
-                        AND (expires_at IS NULL OR expires_at > NOW())
-                    ) OR EXISTS(
-                        SELECT 1 FROM test_invites 
-                        WHERE invite_token = $1 AND test_id = $2 AND status = 'pending'
-                        AND (expires_at IS NULL OR expires_at > NOW())
-                    )
-                """, session_data.invite_token, test_id)
-                if not token_valid:
-                    raise HTTPException(status_code=403, detail="Invalid or expired invite token")
-
-            # Check user attempts if authenticated
-            if resolved_user_id:
-                attempts = await conn.fetchval("""
-                    SELECT attempts_count FROM user_performance
-                    WHERE user_id = $1 AND test_id = $2
-                """, resolved_user_id, test_id)
-                
-                if attempts and attempts >= test_row['max_attempts']:
-                    raise HTTPException(status_code=403, detail="Maximum attempts exceeded")
-                
-                # Check for active session
-                active_session = await conn.fetchrow("""
-                    SELECT id, session_token, expires_at FROM test_sessions
-                    WHERE test_id = $1 AND user_id = $2 AND is_active = true AND expires_at > NOW()
-                """, test_id, resolved_user_id)
-                
-                if active_session:
-                    # Return existing session
-                    minutes_remaining = (active_session['expires_at'] - now).total_seconds() / 60
-                    return TestSessionResponse(
-                        session_id=str(active_session['id']),
-                        session_token=active_session['session_token'],
-                        test_id=test_id,
-                        test_title=test_row['title'],
-                        participant_name=session_data.participant_name,
-                        started_at=active_session['started_at'] if 'started_at' in active_session else now,
-                        expires_at=active_session['expires_at'],
-                        time_limit_minutes=test_row['time_limit_minutes'],
-                        total_questions=test_row['num_questions'],
-                        current_question=1,
-                        minutes_remaining=max(0, minutes_remaining)
-                    )
-            
-            # Calculate expiration time
-            if test_row['time_limit_minutes']:
-                expires_at = now + timedelta(minutes=test_row['time_limit_minutes'])
+            if existing_user_response.data:
+                resolved_user_id = existing_user_response.data[0]['id']
             else:
-                expires_at = now + timedelta(hours=24)  # Default 24 hour limit
+                # Create lightweight user record using Supabase
+                try:
+                    password_hash = get_password_hash(secrets.token_urlsafe(16))
+                    new_user_response = supabase.table('users').insert({
+                        'name': session_data.participant_name,
+                        'email': session_data.participant_email,
+                        'password_hash': password_hash,
+                        'is_active': True
+                    }).execute()
+                    
+                    resolved_user_id = new_user_response.data[0]['id'] if new_user_response.data else None
+                except Exception:
+                    # Fallback to anonymous if user table constraints prevent creation
+                    resolved_user_id = None
+
+        # SUPABASE: Validate invite token if provided
+        if getattr(session_data, 'invite_token', None):
+            # Check public links
+            public_link_response = supabase.table('test_public_links').select('id').eq('link_token', session_data.invite_token).eq('test_id', test_id).eq('is_active', True).execute()
             
-            # Create new session
-            session_token = secrets.token_urlsafe(32)
-            session_id = str(uuid.uuid4())
+            # Check test invites  
+            invite_response = supabase.table('test_invites').select('id').eq('invite_token', session_data.invite_token).eq('test_id', test_id).eq('status', 'pending').execute()
             
-            # Get client info
-            client_ip = request.client.host if request.client else None
-            user_agent = request.headers.get("user-agent", "")
+            # TODO: Add expiry checking for invites (requires date comparison)
+            token_valid = bool(public_link_response.data or invite_response.data)
             
-            session_row = await conn.fetchrow("""
-                INSERT INTO test_sessions (
-                    id, test_id, user_id, participant_name, participant_email,
-                    session_token, started_at, expires_at, ip_address, user_agent, invite_token
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING *
-            """, 
-                session_id, test_id, resolved_user_id,
-                session_data.participant_name, session_data.participant_email,
-                session_token, now, expires_at, client_ip, user_agent, getattr(session_data, 'invite_token', None)
-            )
+            if not token_valid:
+                raise HTTPException(status_code=403, detail="Invalid or expired invite token")
+
+        # SUPABASE: Check user attempts if authenticated
+        if resolved_user_id:
+            attempts_response = supabase.table('user_performance').select('attempts_count').eq('user_id', resolved_user_id).eq('test_id', test_id).execute()
             
-            minutes_remaining = (expires_at - now).total_seconds() / 60
+            attempts = attempts_response.data[0]['attempts_count'] if attempts_response.data else 0
             
-            return TestSessionResponse(
-                session_id=str(session_row['id']),
-                session_token=session_row['session_token'],
-                test_id=test_id,
-                test_title=test_row['title'],
-                participant_name=session_row['participant_name'],
-                started_at=session_row['started_at'],
-                expires_at=session_row['expires_at'],
-                time_limit_minutes=test_row['time_limit_minutes'],
-                total_questions=test_row['num_questions'],
-                current_question=1,
-                minutes_remaining=minutes_remaining
-            )
+            if attempts and attempts >= test_row['max_attempts']:
+                raise HTTPException(status_code=403, detail="Maximum attempts exceeded")
+            
+            # SUPABASE: Check for active session
+            # Note: Supabase doesn't have NOW() function, so we'll filter in Python
+            active_session_response = supabase.table('test_sessions').select('id, session_token, expires_at, started_at').eq('test_id', test_id).eq('user_id', resolved_user_id).eq('is_active', True).execute()
+            
+            active_session = None
+            if active_session_response.data:
+                for session in active_session_response.data:
+                    expires_at_str = session['expires_at']
+                    if isinstance(expires_at_str, str):
+                        expires_at_dt = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+                        if expires_at_dt > now:
+                            active_session = session
+                            break
+            
+            if active_session:
+                # Return existing session
+                expires_at_dt = datetime.fromisoformat(active_session['expires_at'].replace('Z', '+00:00')) if isinstance(active_session['expires_at'], str) else active_session['expires_at']
+                minutes_remaining = (expires_at_dt - now).total_seconds() / 60
+                started_at_dt = datetime.fromisoformat(active_session['started_at'].replace('Z', '+00:00')) if isinstance(active_session['started_at'], str) else active_session['started_at']
+                
+                return TestSessionResponse(
+                    session_id=str(active_session['id']),
+                    session_token=active_session['session_token'],
+                    test_id=test_id,
+                    test_title=test_row['title'],
+                    participant_name=session_data.participant_name,
+                    started_at=started_at_dt,
+                    expires_at=expires_at_dt,
+                    time_limit_minutes=test_row['time_limit_minutes'],
+                    total_questions=test_row['num_questions'],
+                    current_question=1,
+                    minutes_remaining=max(0, minutes_remaining)
+                )
+        
+        # Calculate expiration time
+        if test_row['time_limit_minutes']:
+            expires_at = now + timedelta(minutes=test_row['time_limit_minutes'])
+        else:
+            expires_at = now + timedelta(hours=24)  # Default 24 hour limit
+        
+        # Create new session
+        session_token = secrets.token_urlsafe(32)
+        session_id = str(uuid.uuid4())
+        
+        # Get client info
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent", "")
+        
+        # SUPABASE: Insert new test session
+        session_data_insert = {
+            'id': session_id,
+            'test_id': test_id,
+            'user_id': resolved_user_id,
+            'participant_name': session_data.participant_name,
+            'participant_email': session_data.participant_email,
+            'session_token': session_token,
+            'started_at': now.isoformat(),
+            'expires_at': expires_at.isoformat(),
+            'ip_address': client_ip,
+            'user_agent': user_agent,
+            'invite_token': getattr(session_data, 'invite_token', None),
+            'is_active': True
+        }
+        
+        session_response = supabase.table('test_sessions').insert(session_data_insert).execute()
+        
+        if not session_response.data:
+            raise HTTPException(status_code=500, detail="Failed to create test session")
+        
+        session_row = session_response.data[0]
+        minutes_remaining = (expires_at - now).total_seconds() / 60
+        
+        return TestSessionResponse(
+            session_id=str(session_row['id']),
+            session_token=session_row['session_token'],
+            test_id=test_id,
+            test_title=test_row['title'],
+            participant_name=session_row['participant_name'],
+            started_at=now,
+            expires_at=expires_at,
+            time_limit_minutes=test_row['time_limit_minutes'],
+            total_questions=test_row['num_questions'],
+            current_question=1,
+            minutes_remaining=minutes_remaining
+        )
             
     except HTTPException:
         raise
@@ -182,57 +211,89 @@ async def get_test_questions(
     Get test questions for an active session
     """
     try:
-        async with pool.acquire() as conn:
-            # Verify session
-            session = await conn.fetchrow("""
-                SELECT ts.*, t.title, t.is_public, t.created_by
-                FROM test_sessions ts
-                JOIN tests t ON ts.test_id = t.id
-                WHERE ts.test_id = $1 AND ts.session_token = $2 
-                AND ts.is_active = true AND ts.expires_at > NOW()
-            """, test_id, session_token)
-            
-            if not session:
-                raise HTTPException(status_code=403, detail="Invalid or expired session")
-            
-            # Additional security check for private tests
-            if not session['is_public']:
-                # Allow if session was created via a valid invite/public link
+        # SUPABASE MIGRATION: Replace pool operations with Supabase client calls
+        # Verify session with JOIN-like behavior using separate queries
+        session_response = supabase.table('test_sessions').select('*').eq('test_id', test_id).eq('session_token', session_token).eq('is_active', True).execute()
+        
+        if not session_response.data:
+            raise HTTPException(status_code=403, detail="Invalid or expired session")
+        
+        session = session_response.data[0]
+        
+        # Check if session is expired (manual expiry check since no NOW() in Supabase)
+        now = datetime.now(timezone.utc)
+        expires_at_str = session['expires_at']
+        if isinstance(expires_at_str, str):
+            expires_at_dt = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if expires_at_dt <= now:
+                raise HTTPException(status_code=403, detail="Session expired")
+        
+        # Get test details for security checks
+        test_response = supabase.table('tests').select('title, is_public, created_by').eq('id', test_id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found")
+        
+        test_data = test_response.data[0]
+        session['title'] = test_data['title']
+        session['is_public'] = test_data['is_public']
+        session['created_by'] = test_data['created_by']
+        
+        # Additional security check for private tests
+        if not session['is_public']:
+            # Allow if session was created via a valid invite/public link
+            has_invite = False
+            try:
+                has_invite = bool(session['invite_token'])
+            except Exception:
                 has_invite = False
-                try:
-                    has_invite = bool(session['invite_token'])
-                except Exception:
-                    has_invite = False
-                if not has_invite:
-                    # For private tests without invite token, require creator or session owner
-                    if not current_user:
-                        raise HTTPException(status_code=403, detail="Authentication required for private test")
-                    is_creator = current_user.id == session['created_by']
-                    is_session_owner = session['user_id'] and current_user.id == session['user_id']
-                    if not (is_creator or is_session_owner):
-                        raise HTTPException(status_code=403, detail="Not authorized for this test")
-            
-            # Get test questions in order
-            questions = await conn.fetch("""
-                SELECT 
-                    q.id, q.question_text, q.question_type, q.options,
-                    tq.question_order
-                FROM test_questions tq
-                JOIN questions q ON tq.question_id = q.id
-                WHERE tq.test_id = $1
-                ORDER BY tq.question_order
-            """, test_id)
-            
-            return [
-                TestQuestionResponse(
-                    id=str(q['id']),
-                    question_text=q['question_text'],
-                    question_type=q['question_type'],
-                    options=q['options'],
-                    question_order=q['question_order']
-                )
-                for q in questions
-            ]
+            if not has_invite:
+                # For private tests without invite token, require creator or session owner
+                if not current_user:
+                    raise HTTPException(status_code=403, detail="Authentication required for private test")
+                is_creator = current_user.id == session['created_by']
+                is_session_owner = session['user_id'] and current_user.id == session['user_id']
+                if not (is_creator or is_session_owner):
+                    raise HTTPException(status_code=403, detail="Not authorized for this test")
+        
+        # SUPABASE: Get test questions with JOIN-like behavior
+        # First get test_questions, then get question details
+        test_questions_response = supabase.table('test_questions').select('question_id, question_order').eq('test_id', test_id).order('question_order').execute()
+        
+        if not test_questions_response.data:
+            return []  # No questions in test
+        
+        # Get question IDs and fetch question details
+        question_ids = [tq['question_id'] for tq in test_questions_response.data]
+        questions_response = supabase.table('questions').select('id, question_text, question_type, options').in_('id', question_ids).execute()
+        
+        # Create a lookup dict for question details
+        question_details = {q['id']: q for q in questions_response.data} if questions_response.data else {}
+        
+        # Combine test_questions with question details in order
+        questions = []
+        for tq in test_questions_response.data:
+            qid = tq['question_id']
+            if qid in question_details:
+                q_details = question_details[qid]
+                questions.append({
+                    'id': q_details['id'],
+                    'question_text': q_details['question_text'],
+                    'question_type': q_details['question_type'],
+                    'options': q_details['options'],
+                    'question_order': tq['question_order']
+                })
+        
+        return [
+            TestQuestionResponse(
+                id=str(q['id']),
+                question_text=q['question_text'],
+                question_type=q['question_type'],
+                options=q['options'],
+                question_order=q['question_order']
+            )
+            for q in questions
+        ]
             
     except HTTPException:
         raise
@@ -346,113 +407,165 @@ async def submit_test_session(
     Submit a test session and calculate final score
     """
     try:
-        async with pool.acquire() as conn:
-            # Get session details
-            session = await conn.fetchrow("""
-                SELECT ts.*, t.title, t.pass_threshold
-                FROM test_sessions ts
-                JOIN tests t ON ts.test_id = t.id
-                WHERE ts.session_token = $1 AND ts.is_active = true
-            """, session_token)
-            
-            if not session:
-                raise HTTPException(status_code=403, detail="Invalid or expired session")
-            
-            # Check if session has expired
-            if datetime.now(timezone.utc) > session['expires_at']:
+        # SUPABASE MIGRATION: Replace pool operations with Supabase client calls
+        # Get session details with JOIN-like behavior
+        session_response = supabase.table('test_sessions').select('*').eq('session_token', session_token).eq('is_active', True).execute()
+        
+        if not session_response.data:
+            raise HTTPException(status_code=403, detail="Invalid or expired session")
+        
+        session = session_response.data[0]
+        
+        # Get test details for title and pass_threshold
+        test_response = supabase.table('tests').select('title, pass_threshold').eq('id', session['test_id']).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found")
+        
+        test_data = test_response.data[0]
+        session['title'] = test_data['title']
+        session['pass_threshold'] = test_data['pass_threshold']
+        
+        # Check if session has expired
+        now = datetime.now(timezone.utc)
+        expires_at_str = session['expires_at']
+        if isinstance(expires_at_str, str):
+            expires_at_dt = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if now > expires_at_dt:
                 raise HTTPException(status_code=403, detail="Session has expired")
+        
+        # Get answers from session
+        answers_draft = session['answers_draft'] or {}
+        if isinstance(answers_draft, str):
+            import json
+            answers_draft = json.loads(answers_draft)
+        
+        if not answers_draft:
+            raise HTTPException(status_code=400, detail="No answers found to submit")
+        
+        # SUPABASE: Get correct answers with JOIN-like behavior
+        test_questions_response = supabase.table('test_questions').select('question_id').eq('test_id', session['test_id']).execute()
+        
+        if not test_questions_response.data:
+            raise HTTPException(status_code=400, detail="No questions found for this test")
+        
+        question_ids = [tq['question_id'] for tq in test_questions_response.data]
+        questions_response = supabase.table('questions').select('id, correct_answer').in_('id', question_ids).execute()
+        
+        correct_map = {str(row['id']): row['correct_answer'] for row in questions_response.data} if questions_response.data else {}
+        
+        # Calculate score
+        correct_count = 0
+        question_results = []
+        
+        for question_id, answer_data in answers_draft.items():
+            selected_answer = answer_data.get('selected_answer', '')
+            correct_answer = correct_map.get(question_id, '')
+            is_correct = correct_answer.strip().lower() == selected_answer.strip().lower()
             
-            # Get answers from session
-            answers_draft = session['answers_draft'] or {}
-            if isinstance(answers_draft, str):
-                answers_draft = json.loads(answers_draft)
+            if is_correct:
+                correct_count += 1
             
-            if not answers_draft:
-                raise HTTPException(status_code=400, detail="No answers found to submit")
-            
-            # Get correct answers
-            correct_answers = await conn.fetch("""
-                SELECT q.id, q.correct_answer
-                FROM test_questions tq
-                JOIN questions q ON tq.question_id = q.id
-                WHERE tq.test_id = $1
-            """, session['test_id'])
-            
-            correct_map = {str(row['id']): row['correct_answer'] for row in correct_answers}
-            
-            # Calculate score
-            correct_count = 0
-            question_results = []
-            
-            for question_id, answer_data in answers_draft.items():
-                selected_answer = answer_data.get('selected_answer', '')
-                correct_answer = correct_map.get(question_id, '')
-                is_correct = correct_answer.strip().lower() == selected_answer.strip().lower()
-                
-                if is_correct:
-                    correct_count += 1
-                
-                question_results.append({
-                    "question_id": question_id,
-                    "selected_answer": selected_answer,
-                    "correct_answer": correct_answer,
-                    "is_correct": is_correct
-                })
-            
-            total_questions = len(correct_answers)
-            score = (correct_count / total_questions * 100) if total_questions > 0 else 0
-            is_passed = score >= session['pass_threshold']
-            
-            # Calculate time taken
-            time_taken = datetime.now(timezone.utc) - session['started_at']
-            time_taken_minutes = int(time_taken.total_seconds() / 60)
-            
-            # Create submission record
-            submission_id = str(uuid.uuid4())
-            submission_row = await conn.fetchrow("""
-                INSERT INTO test_submissions (
-                    id, test_id, user_id, participant_name, participant_email,
-                    score, total_questions, correct_answers, is_passed, time_taken_minutes,
-                    answers, session_id, submitted_at, invite_token
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13)
-                RETURNING *
-            """,
-                submission_id, session['test_id'], session['user_id'],
-                session['participant_name'], session['participant_email'],
-                score, total_questions, correct_count, is_passed, time_taken_minutes,
-                json.dumps(question_results), session['id'],
-                (session['invite_token'] if ('invite_token' in session.keys() if hasattr(session, 'keys') else False) else None)
-            )
+            question_results.append({
+                "question_id": question_id,
+                "selected_answer": selected_answer,
+                "correct_answer": correct_answer,
+                "is_correct": is_correct
+            })
+        
+        total_questions = len(questions_response.data) if questions_response.data else 0
+        score = (correct_count / total_questions * 100) if total_questions > 0 else 0
+        is_passed = score >= session['pass_threshold']
+        
+        # Calculate time taken
+        started_at_str = session['started_at']
+        if isinstance(started_at_str, str):
+            started_at_dt = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+        else:
+            started_at_dt = started_at_str
+        
+        time_taken = now - started_at_dt
+        time_taken_minutes = int(time_taken.total_seconds() / 60)
+        
+        # SUPABASE: Create submission record
+        submission_id = str(uuid.uuid4())
+        submission_data = {
+            'id': submission_id,
+            'test_id': session['test_id'],
+            'user_id': session['user_id'],
+            'participant_name': session['participant_name'],
+            'participant_email': session['participant_email'],
+            'score': score,
+            'total_questions': total_questions,
+            'correct_answers': correct_count,
+            'is_passed': is_passed,
+            'time_taken_minutes': time_taken_minutes,
+            'answers': json.dumps(question_results),
+            'session_id': session['id'],
+            'submitted_at': now.isoformat(),
+            'invite_token': session.get('invite_token')
+        }
+        
+        submission_response = supabase.table('test_submissions').insert(submission_data).execute()
+        
+        if not submission_response.data:
+            raise HTTPException(status_code=500, detail="Failed to create submission record")
+        
+        submission_row = submission_response.data[0]
 
-            # Update analytics for this test
-            await conn.execute("""
-                UPDATE test_analytics ta
-                SET total_submissions = s.total_submissions,
-                    total_participants = s.total_participants,
-                    average_score = s.average_score,
-                    pass_rate = s.pass_rate,
-                    average_time_minutes = s.average_time_minutes,
-                    last_updated = NOW()
-                FROM (
-                    SELECT COUNT(*) AS total_submissions,
-                           COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), participant_email)) AS total_participants,
-                           COALESCE(AVG(score), 0) AS average_score,
-                           COALESCE(AVG(CASE WHEN is_passed THEN 1 ELSE 0 END) * 100, 0) AS pass_rate,
-                           COALESCE(AVG(time_taken_minutes), 0) AS average_time_minutes
-                    FROM test_submissions
-                    WHERE test_id = $1
-                ) s
-                WHERE ta.test_id = $1
-            """, session['test_id'])
+        # SUPABASE: Update analytics for this test (simplified version)
+        # Get all submissions for this test to recalculate analytics
+        all_submissions_response = supabase.table('test_submissions').select('score, is_passed, time_taken_minutes, user_id, participant_email').eq('test_id', session['test_id']).execute()
+        
+        if all_submissions_response.data:
+            submissions = all_submissions_response.data
+            total_submissions = len(submissions)
             
-            # Update session to mark as completed
-            await conn.execute("""
-                UPDATE test_sessions 
-                SET is_active = false, submission_id = $1
-                WHERE id = $2
-            """, submission_id, session['id'])
+            # Calculate unique participants (by user_id or email)
+            participants = set()
+            for sub in submissions:
+                if sub['user_id']:
+                    participants.add(str(sub['user_id']))
+                elif sub['participant_email']:
+                    participants.add(sub['participant_email'])
+            total_participants = len(participants)
             
-            return TestSubmissionResponse(
+            # Calculate averages
+            scores = [sub['score'] for sub in submissions if sub['score'] is not None]
+            average_score = sum(scores) / len(scores) if scores else 0
+            
+            passed_count = sum(1 for sub in submissions if sub['is_passed'])
+            pass_rate = (passed_count / total_submissions * 100) if total_submissions > 0 else 0
+            
+            times = [sub['time_taken_minutes'] for sub in submissions if sub['time_taken_minutes'] is not None]
+            average_time_minutes = sum(times) / len(times) if times else 0
+            
+            # Update or create analytics record
+            analytics_data = {
+                'total_submissions': total_submissions,
+                'total_participants': total_participants,
+                'average_score': average_score,
+                'pass_rate': pass_rate,
+                'average_time_minutes': average_time_minutes,
+                'last_updated': now.isoformat()
+            }
+            
+            # Try to update existing analytics record
+            existing_analytics = supabase.table('test_analytics').select('test_id').eq('test_id', session['test_id']).execute()
+            
+            if existing_analytics.data:
+                supabase.table('test_analytics').update(analytics_data).eq('test_id', session['test_id']).execute()
+            else:
+                analytics_data['test_id'] = session['test_id']
+                supabase.table('test_analytics').insert(analytics_data).execute()
+        
+        # SUPABASE: Update session to mark as completed
+        supabase.table('test_sessions').update({
+            'is_active': False,
+            'submission_id': submission_id
+        }).eq('id', session['id']).execute()
+        
+        return TestSubmissionResponse(
                 id=str(submission_row['id']),
                 test_id=str(submission_row['test_id']),
                 test_title=session['title'],

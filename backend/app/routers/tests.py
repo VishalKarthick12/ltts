@@ -430,73 +430,56 @@ async def update_test(
     Update test settings (only by creator)
     """
     try:
-        async with pool.acquire() as conn:
-            # Check if test exists and user is creator
-            test_row = await conn.fetchrow("""
-                SELECT * FROM tests WHERE id = $1 AND created_by = $2
-            """, test_id, current_user.id)
-            
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found or not authorized")
-            
-            # Build update query dynamically
-            updates = []
-            params = []
-            param_count = 0
-            
-            update_fields = update_data.dict(exclude_unset=True)
-            for field, value in update_fields.items():
-                if value is not None:
-                    param_count += 1
-                    updates.append(f"{field} = ${param_count}")
-                    params.append(value)
-            
-            if not updates:
-                raise HTTPException(status_code=400, detail="No fields to update")
-            
-            # Add updated_at
-            param_count += 1
-            updates.append(f"updated_at = ${param_count}")
-            params.append(datetime.utcnow())
-            
-            # Add test_id for WHERE clause
-            param_count += 1
-            params.append(test_id)
-            
-            query = f"""
-                UPDATE tests 
-                SET {', '.join(updates)}
-                WHERE id = ${param_count}
-                RETURNING *
-            """
-            
-            updated_row = await conn.fetchrow(query, *params)
-            
-            # Get creator name
-            creator = await conn.fetchrow("SELECT name FROM users WHERE id = $1", current_user.id)
-            
-            return TestResponse(
-                id=str(updated_row['id']),
-                title=updated_row['title'],
-                description=updated_row['description'],
-                question_bank_id=str(updated_row['question_bank_id']),
-                question_bank_ids=(updated_row['question_bank_ids'] if isinstance(updated_row['question_bank_ids'], list) else None),
-                created_by=str(updated_row['created_by']),
-                creator_name=creator['name'] if creator else current_user.name,
-                num_questions=updated_row['num_questions'],
-                time_limit_minutes=updated_row['time_limit_minutes'],
-                difficulty_filter=updated_row['difficulty_filter'],
-                category_filter=updated_row['category_filter'],
-                is_active=updated_row['is_active'],
-                is_public=updated_row['is_public'],
-                scheduled_start=updated_row['scheduled_start'],
-                scheduled_end=updated_row['scheduled_end'],
-                max_attempts=updated_row['max_attempts'],
-                pass_threshold=updated_row['pass_threshold'],
-                created_at=updated_row['created_at'],
-                updated_at=updated_row['updated_at'],
-                test_link=f"/test/{updated_row['id']}"
-            )
+        # SUPABASE MIGRATION: Replace pool operations with Supabase client calls
+        # Check if test exists and user is creator
+        test_response = supabase.table('tests').select('*').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or not authorized")
+        
+        # Build update data
+        update_fields = update_data.dict(exclude_unset=True)
+        if not update_fields:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        # Add updated_at timestamp
+        update_fields['updated_at'] = datetime.utcnow().isoformat()
+        
+        # SUPABASE: Update the test
+        update_response = supabase.table('tests').update(update_fields).eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update test")
+        
+        updated_row = update_response.data[0]
+        
+        return TestResponse(
+            id=str(updated_row['id']),
+            title=updated_row['title'],
+            description=updated_row['description'],
+            question_bank_id=str(updated_row['question_bank_id']),
+            question_bank_ids=(updated_row['question_bank_ids'] if isinstance(updated_row['question_bank_ids'], list) else None),
+            question_bank_names=[],  # Simplified for now
+            created_by=str(updated_row['created_by']),
+            creator_name=current_user.name,  # Use current user's name since they're the creator
+            num_questions=updated_row['num_questions'],
+            time_limit_minutes=updated_row['time_limit_minutes'],
+            difficulty_filter=updated_row['difficulty_filter'],
+            category_filter=updated_row['category_filter'],
+            is_active=updated_row['is_active'],
+            is_public=updated_row['is_public'],
+            scheduled_start=datetime.fromisoformat(updated_row['scheduled_start'].replace('Z', '+00:00')) if updated_row.get('scheduled_start') and isinstance(updated_row['scheduled_start'], str) else updated_row.get('scheduled_start'),
+            scheduled_end=datetime.fromisoformat(updated_row['scheduled_end'].replace('Z', '+00:00')) if updated_row.get('scheduled_end') and isinstance(updated_row['scheduled_end'], str) else updated_row.get('scheduled_end'),
+            max_attempts=updated_row['max_attempts'],
+            pass_threshold=updated_row['pass_threshold'],
+            created_at=datetime.fromisoformat(updated_row['created_at'].replace('Z', '+00:00')) if isinstance(updated_row['created_at'], str) else updated_row['created_at'],
+            updated_at=datetime.fromisoformat(updated_row['updated_at'].replace('Z', '+00:00')) if isinstance(updated_row['updated_at'], str) else updated_row['updated_at'],
+            test_link=f"/test/{updated_row['id']}",
+            total_submissions=0,  # Will be populated by analytics if needed
+            total_participants=0,
+            average_score=0,
+            pass_rate=0
+        )
             
     except HTTPException:
         raise
