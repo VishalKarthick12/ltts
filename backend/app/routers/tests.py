@@ -34,118 +34,130 @@ async def create_test(
     try:
         test_id = str(uuid.uuid4())
         
-        async with pool.acquire() as conn:
-            # Determine selected question banks (multiple or single)
-            banks = test_data.question_bank_ids or ([] if not test_data.question_bank_id else [test_data.question_bank_id])
-            if not banks:
-                raise HTTPException(status_code=400, detail="Please select at least one question bank")
+        # SUPABASE MIGRATION: Replace pool.acquire() with direct Supabase client calls
+        # Determine selected question banks (multiple or single)
+        banks = test_data.question_bank_ids or ([] if not test_data.question_bank_id else [test_data.question_bank_id])
+        if not banks:
+            raise HTTPException(status_code=400, detail="Please select at least one question bank")
 
-            # Build desired distribution across banks
-            k = len(banks)
-            total = test_data.num_questions
-            base = total // k
-            rem = total % k
-            target_counts = [base + (1 if i < rem else 0) for i in range(k)]
+        # Build desired distribution across banks
+        k = len(banks)
+        total = test_data.num_questions
+        base = total // k
+        rem = total % k
+        target_counts = [base + (1 if i < rem else 0) for i in range(k)]
 
-            # Fetch availability per bank with filters
-            diff_val = test_data.difficulty_filter.value if test_data.difficulty_filter else None
-            cat_val = test_data.category_filter
-            available_per_bank = []
-            for b in banks:
-                avail = await conn.fetchval(
-                    """
-                    SELECT COUNT(*) FROM questions 
-                    WHERE question_bank_id = $1
-                    AND ($2::text IS NULL OR difficulty_level = $2)
-                    AND ($3::text IS NULL OR category = $3)
-                    """,
-                    b, diff_val, cat_val
-                )
-                available_per_bank.append(int(avail or 0))
+        # SUPABASE: Fetch availability per bank with filters
+        diff_val = test_data.difficulty_filter.value if test_data.difficulty_filter else None
+        cat_val = test_data.category_filter
+        available_per_bank = []
+        
+        for b in banks:
+            # Build Supabase query for question count
+            query = supabase.table('questions').select('id', count='exact').eq('question_bank_id', b)
+            if diff_val:
+                query = query.eq('difficulty_level', diff_val)
+            if cat_val:
+                query = query.eq('category', cat_val)
+            
+            count_response = query.execute()
+            available_per_bank.append(count_response.count or 0)
 
-            # Rebalance allocation if some banks do not have enough questions
-            final_counts = target_counts[:]
-            shortage = 0
+        # Rebalance allocation if some banks do not have enough questions
+        final_counts = target_counts[:]
+        shortage = 0
+        for i in range(k):
+            if available_per_bank[i] < final_counts[i]:
+                shortage += (final_counts[i] - available_per_bank[i])
+                final_counts[i] = available_per_bank[i]
+        if shortage > 0:
             for i in range(k):
-                if available_per_bank[i] < final_counts[i]:
-                    shortage += (final_counts[i] - available_per_bank[i])
-                    final_counts[i] = available_per_bank[i]
-            if shortage > 0:
-                for i in range(k):
-                    if shortage == 0:
-                        break
-                    extra = max(available_per_bank[i] - final_counts[i], 0)
-                    if extra > 0:
-                        take = min(extra, shortage)
-                        final_counts[i] += take
-                        shortage -= take
+                if shortage == 0:
+                    break
+                extra = max(available_per_bank[i] - final_counts[i], 0)
+                if extra > 0:
+                    take = min(extra, shortage)
+                    final_counts[i] += take
+                    shortage -= take
 
-            if sum(final_counts) < total:
-                total_available = sum(available_per_bank)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Not enough questions across selected banks. Available {total_available}, requested {total}."
-                )
-
-            # Create test record, storing question_bank_ids JSONB and keeping first bank for backward compatibility
-            import json
-            primary_bank = banks[0]
-            test_row = await conn.fetchrow(
-                """
-                INSERT INTO tests (
-                    id, title, description, question_bank_id, created_by, num_questions,
-                    time_limit_minutes, difficulty_filter, category_filter, is_public,
-                    scheduled_start, scheduled_end, max_attempts, pass_threshold, question_bank_ids
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)
-                RETURNING *
-                """,
-                test_id, test_data.title, test_data.description, primary_bank,
-                current_user.id, test_data.num_questions, test_data.time_limit_minutes,
-                diff_val, cat_val, test_data.is_public, test_data.scheduled_start,
-                test_data.scheduled_end, test_data.max_attempts, test_data.pass_threshold,
-                json.dumps(banks)
+        if sum(final_counts) < total:
+            total_available = sum(available_per_bank)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough questions across selected banks. Available {total_available}, requested {total}."
             )
 
-            # Select random questions from each bank according to final_counts
-            question_order = 1
-            for idx, b in enumerate(banks):
-                count = final_counts[idx]
-                if count <= 0:
-                    continue
-                qs = await conn.fetch(
-                    """
-                    SELECT id FROM questions
-                    WHERE question_bank_id = $1
-                    AND ($2::text IS NULL OR difficulty_level = $2)
-                    AND ($3::text IS NULL OR category = $3)
-                    ORDER BY RANDOM()
-                    LIMIT $4
-                    """,
-                    b, diff_val, cat_val, count
-                )
-                for q in qs:
-                    await conn.execute(
-                        """
-                        INSERT INTO test_questions (test_id, question_id, question_order)
-                        VALUES ($1, $2, $3)
-                        """,
-                        test_id, q['id'], question_order
-                    )
+        # SUPABASE: Create test record with JSON array support
+        import json
+        primary_bank = banks[0]
+        test_data_insert = {
+            'id': test_id,
+            'title': test_data.title,
+            'description': test_data.description,
+            'question_bank_id': primary_bank,
+            'created_by': current_user.id,
+            'num_questions': test_data.num_questions,
+            'time_limit_minutes': test_data.time_limit_minutes,
+            'difficulty_filter': diff_val,
+            'category_filter': cat_val,
+            'is_public': test_data.is_public,
+            'scheduled_start': test_data.scheduled_start.isoformat() if test_data.scheduled_start else None,
+            'scheduled_end': test_data.scheduled_end.isoformat() if test_data.scheduled_end else None,
+            'max_attempts': test_data.max_attempts,
+            'pass_threshold': test_data.pass_threshold,
+            'question_bank_ids': banks  # Supabase handles JSON arrays natively
+        }
+        
+        test_response = supabase.table('tests').insert(test_data_insert).execute()
+        if not test_response.data:
+            raise HTTPException(status_code=500, detail="Failed to create test")
+        test_row = test_response.data[0]
+
+        # SUPABASE: Select random questions from each bank according to final_counts
+        question_order = 1
+        test_questions_batch = []
+        
+        for idx, b in enumerate(banks):
+            count = final_counts[idx]
+            if count <= 0:
+                continue
+                
+            # Build Supabase query for random questions
+            query = supabase.table('questions').select('id').eq('question_bank_id', b)
+            if diff_val:
+                query = query.eq('difficulty_level', diff_val)
+            if cat_val:
+                query = query.eq('category', cat_val)
+            
+            # Note: Supabase doesn't have RANDOM(), so we'll fetch more and randomly select
+            questions_response = query.limit(count * 3).execute()  # Get more to randomize
+            
+            if questions_response.data:
+                import random
+                available_questions = questions_response.data
+                random.shuffle(available_questions)
+                selected_questions = available_questions[:count]
+                
+                for q in selected_questions:
+                    test_questions_batch.append({
+                        'test_id': test_id,
+                        'question_id': q['id'],
+                        'question_order': question_order
+                    })
                     question_order += 1
-            
-            # Initialize analytics record
-            await conn.execute("""
-                INSERT INTO test_analytics (test_id) VALUES ($1)
-            """, test_id)
-            
-            # Resolve bank names for response
-            bank_names = await conn.fetch(
-                "SELECT name FROM question_banks WHERE id = ANY($1::uuid[]) ORDER BY name",
-                banks
-            )
-            bank_names_list = [r['name'] for r in bank_names]
+        
+        # SUPABASE: Batch insert test questions
+        if test_questions_batch:
+            supabase.table('test_questions').insert(test_questions_batch).execute()
+        
+        # SUPABASE: Initialize analytics record
+        supabase.table('test_analytics').insert({'test_id': test_id}).execute()
+        
+        # SUPABASE: Resolve bank names for response
+        bank_names_response = supabase.table('question_banks').select('name').in_('id', banks).execute()
+        bank_names_list = [r['name'] for r in bank_names_response.data] if bank_names_response.data else []
 
-            return TestResponse(
+        return TestResponse(
                 id=str(test_row['id']),
                 title=test_row['title'],
                 description=test_row['description'],
@@ -189,94 +201,103 @@ async def get_tests(
     Get list of tests with analytics
     """
     try:
-        # Build dynamic query
-        conditions = ["1=1"]
-        params = []
-        param_count = 0
+        # SUPABASE MIGRATION: Replace complex SQL with multiple Supabase queries
+        # Build Supabase query for tests
+        query = supabase.table('tests').select('*')
         
+        # Apply filters
         if question_bank_id:
-            param_count += 1
-            # Match if the filtered bank is either the legacy single bank or present in the JSONB array
-            conditions.append(
-                f"(${param_count}::uuid = ANY(COALESCE((SELECT array_agg((elem)::uuid) FROM jsonb_array_elements_text(t.question_bank_ids) elem), ARRAY[t.question_bank_id]::uuid[])))"
-            )
-            params.append(question_bank_id)
+            # For Supabase, we'll filter after fetching since JSONB array filtering is complex
+            pass  # Will filter in Python below
         
         if is_active is not None:
-            param_count += 1
-            conditions.append(f"t.is_active = ${param_count}")
-            params.append(is_active)
+            query = query.eq('is_active', is_active)
         
         if created_by_me and current_user:
-            param_count += 1
-            conditions.append(f"t.created_by = ${param_count}::uuid")
-            params.append(current_user.id)
+            query = query.eq('created_by', current_user.id)
         
         # If not authenticated, only show public tests
         if not current_user:
-            conditions.append("t.is_public = true")
+            query = query.eq('is_public', True)
         
-        query = f"""
-            SELECT 
-                t.*,
-                u.name as creator_name,
-                ta.total_submissions,
-                ta.total_participants,
-                ta.average_score,
-                ta.pass_rate,
-                bn.bank_names
-            FROM tests t
-            LEFT JOIN users u ON t.created_by = u.id
-            LEFT JOIN test_analytics ta ON t.id = ta.test_id
-            LEFT JOIN LATERAL (
-                SELECT array_agg(qb.name ORDER BY qb.name) AS bank_names
-                FROM question_banks qb
-                WHERE qb.id = ANY(
-                    COALESCE(
-                        (SELECT array_agg((elem)::uuid) FROM jsonb_array_elements_text(t.question_bank_ids) elem),
-                        ARRAY[t.question_bank_id]::uuid[]
-                    )
-                )
-            ) bn ON TRUE
-            WHERE {' AND '.join(conditions)}
-            ORDER BY t.created_at DESC
-            OFFSET ${param_count + 1} LIMIT ${param_count + 2}
-        """
-        params.extend([skip, limit])
+        # Get tests with pagination
+        tests_response = query.order('created_at', desc=True).range(skip, skip + limit - 1).execute()
         
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(query, *params)
+        # Process each test to get related data
+        test_results = []
+        for test_row in tests_response.data:
+            # SUPABASE: Filter by question_bank_id if needed (since we can't do complex JSONB queries easily)
+            if question_bank_id:
+                test_bank_ids = test_row.get('question_bank_ids', [])
+                if isinstance(test_bank_ids, str):
+                    import json
+                    try:
+                        test_bank_ids = json.loads(test_bank_ids)
+                    except:
+                        test_bank_ids = []
+                
+                single_bank_id = test_row.get('question_bank_id')
+                all_bank_ids = test_bank_ids if test_bank_ids else ([single_bank_id] if single_bank_id else [])
+                
+                if question_bank_id not in all_bank_ids:
+                    continue  # Skip this test
             
-            return [
-                TestResponse(
-                    id=str(row['id']),
-                    title=row['title'],
-                    description=row['description'],
-                    question_bank_id=str(row['question_bank_id']),
-                    question_bank_ids=(row['question_bank_ids'] if isinstance(row['question_bank_ids'], list) else None),
-                    question_bank_names=row['bank_names'],
-                    created_by=str(row['created_by']),
-                    creator_name=row['creator_name'],
-                    num_questions=row['num_questions'],
-                    time_limit_minutes=row['time_limit_minutes'],
-                    difficulty_filter=row['difficulty_filter'],
-                    category_filter=row['category_filter'],
-                    is_active=row['is_active'],
-                    is_public=row['is_public'],
-                    scheduled_start=row['scheduled_start'],
-                    scheduled_end=row['scheduled_end'],
-                    max_attempts=row['max_attempts'],
-                    pass_threshold=row['pass_threshold'],
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
-                    test_link=f"/test/{row['id']}",
-                    total_submissions=row['total_submissions'] or 0,
-                    total_participants=row['total_participants'] or 0,
-                    average_score=float(row['average_score']) if row['average_score'] else 0,
-                    pass_rate=float(row['pass_rate']) if row['pass_rate'] else 0
-                )
-                for row in rows
-            ]
+            # SUPABASE: Get creator name
+            creator_response = supabase.table('users').select('name').eq('id', test_row['created_by']).execute()
+            creator_name = creator_response.data[0]['name'] if creator_response.data else 'Unknown'
+            
+            # SUPABASE: Get analytics data
+            analytics_response = supabase.table('test_analytics').select('*').eq('test_id', test_row['id']).execute()
+            analytics = analytics_response.data[0] if analytics_response.data else {}
+            
+            # SUPABASE: Get question bank names
+            bank_ids = test_row.get('question_bank_ids', [])
+            if isinstance(bank_ids, str):
+                import json
+                try:
+                    bank_ids = json.loads(bank_ids)
+                except:
+                    bank_ids = []
+            
+            if not bank_ids:
+                single_bank = test_row.get('question_bank_id')
+                bank_ids = [single_bank] if single_bank else []
+            
+            bank_names = []
+            if bank_ids:
+                bank_names_response = supabase.table('question_banks').select('name').in_('id', bank_ids).execute()
+                bank_names = [b['name'] for b in bank_names_response.data] if bank_names_response.data else []
+            
+            # SUPABASE: Build TestResponse object
+            test_results.append(TestResponse(
+                id=str(test_row['id']),
+                title=test_row['title'],
+                description=test_row['description'],
+                question_bank_id=str(test_row['question_bank_id']),
+                question_bank_ids=(test_row['question_bank_ids'] if isinstance(test_row['question_bank_ids'], list) else None),
+                question_bank_names=bank_names,
+                created_by=str(test_row['created_by']),
+                creator_name=creator_name,
+                num_questions=test_row['num_questions'],
+                time_limit_minutes=test_row['time_limit_minutes'],
+                difficulty_filter=test_row['difficulty_filter'],
+                category_filter=test_row['category_filter'],
+                is_active=test_row['is_active'],
+                is_public=test_row['is_public'],
+                scheduled_start=datetime.fromisoformat(test_row['scheduled_start'].replace('Z', '+00:00')) if test_row.get('scheduled_start') and isinstance(test_row['scheduled_start'], str) else test_row.get('scheduled_start'),
+                scheduled_end=datetime.fromisoformat(test_row['scheduled_end'].replace('Z', '+00:00')) if test_row.get('scheduled_end') and isinstance(test_row['scheduled_end'], str) else test_row.get('scheduled_end'),
+                max_attempts=test_row['max_attempts'],
+                pass_threshold=test_row['pass_threshold'],
+                created_at=datetime.fromisoformat(test_row['created_at'].replace('Z', '+00:00')) if isinstance(test_row['created_at'], str) else test_row['created_at'],
+                updated_at=datetime.fromisoformat(test_row['updated_at'].replace('Z', '+00:00')) if isinstance(test_row['updated_at'], str) else test_row['updated_at'],
+                test_link=f"/test/{test_row['id']}",
+                total_submissions=analytics.get('total_submissions', 0) or 0,
+                total_participants=analytics.get('total_participants', 0) or 0,
+                average_score=float(analytics.get('average_score', 0) or 0),
+                pass_rate=float(analytics.get('pass_rate', 0) or 0)
+            ))
+        
+        return test_results
     except Exception as e:
         logger.error(f"Error fetching tests: {e}")
         raise HTTPException(status_code=500, detail="Error fetching tests")
@@ -294,80 +315,103 @@ async def get_test_details(
     Get test details with questions (for taking the test)
     """
     try:
-        async with pool.acquire() as conn:
-            # Get test info
-            test_row = await conn.fetchrow("""
-                SELECT t.*, u.name as creator_name
-                FROM tests t
-                LEFT JOIN users u ON t.created_by = u.id
-                WHERE t.id = $1
-            """, test_id)
-            
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found")
-            
-            # Check if test is accessible
-            if not test_row['is_public'] and (not current_user or current_user.id != test_row['created_by']):
-                raise HTTPException(status_code=403, detail="Test is not public")
-            
-            # Check if test is scheduled and available
-            now = datetime.utcnow()
-            if test_row['scheduled_start'] and now < test_row['scheduled_start']:
+        # SUPABASE MIGRATION: Replace pool operations with Supabase client calls
+        # Get test info with creator details
+        test_response = supabase.table('tests').select('*').eq('id', test_id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found")
+        
+        test_row = test_response.data[0]
+        
+        # Get creator name
+        creator_response = supabase.table('users').select('name').eq('id', test_row['created_by']).execute()
+        creator_name = creator_response.data[0]['name'] if creator_response.data else 'Unknown'
+        test_row['creator_name'] = creator_name
+        
+        # Check if test is accessible
+        if not test_row['is_public'] and (not current_user or current_user.id != test_row['created_by']):
+            raise HTTPException(status_code=403, detail="Test is not public")
+        
+        # Check if test is scheduled and available
+        now = datetime.utcnow()
+        scheduled_start = test_row.get('scheduled_start')
+        scheduled_end = test_row.get('scheduled_end')
+        
+        if scheduled_start:
+            if isinstance(scheduled_start, str):
+                scheduled_start = datetime.fromisoformat(scheduled_start.replace('Z', '+00:00'))
+            if now < scheduled_start:
                 raise HTTPException(status_code=403, detail="Test has not started yet")
-            if test_row['scheduled_end'] and now > test_row['scheduled_end']:
+        
+        if scheduled_end:
+            if isinstance(scheduled_end, str):
+                scheduled_end = datetime.fromisoformat(scheduled_end.replace('Z', '+00:00'))
+            if now > scheduled_end:
                 raise HTTPException(status_code=403, detail="Test has ended")
+        
+        # SUPABASE: Get test questions with join-like behavior
+        test_questions_response = supabase.table('test_questions').select('*').eq('test_id', test_id).order('question_order').execute()
+        
+        questions = []
+        if test_questions_response.data:
+            question_ids = [tq['question_id'] for tq in test_questions_response.data]
+            questions_response = supabase.table('questions').select('id, question_text, question_type, options').in_('id', question_ids).execute()
             
-            # Get test questions
-            questions = await conn.fetch("""
-                SELECT 
-                    q.id, q.question_text, q.question_type, q.options,
-                    tq.question_order
-                FROM test_questions tq
-                JOIN questions q ON tq.question_id = q.id
-                WHERE tq.test_id = $1
-                ORDER BY tq.question_order
-            """, test_id)
+            # Create a lookup dict for question details
+            question_details = {q['id']: q for q in questions_response.data} if questions_response.data else {}
             
-            # Check user attempts if authenticated
-            user_attempts = 0
-            user_best_score = None
-            can_attempt = True
+            # Combine test_questions with question details
+            for tq in test_questions_response.data:
+                qid = tq['question_id']
+                if qid in question_details:
+                    q_details = question_details[qid]
+                    questions.append({
+                        'id': q_details['id'],
+                        'question_text': q_details['question_text'],
+                        'question_type': q_details['question_type'],
+                        'options': q_details['options'],
+                        'question_order': tq['question_order']
+                    })
+        
+        # SUPABASE: Check user attempts if authenticated
+        user_attempts = 0
+        user_best_score = None
+        can_attempt = True
+        
+        if current_user:
+            performance_response = supabase.table('user_performance').select('attempts_count, best_score').eq('user_id', current_user.id).eq('test_id', test_id).execute()
             
-            if current_user:
-                performance = await conn.fetchrow("""
-                    SELECT attempts_count, best_score FROM user_performance
-                    WHERE user_id = $1 AND test_id = $2
-                """, current_user.id, test_id)
-                
-                if performance:
-                    user_attempts = performance['attempts_count']
-                    user_best_score = float(performance['best_score'])
-                    can_attempt = user_attempts < test_row['max_attempts']
-            
-            return TestDetailsResponse(
-                id=str(test_row['id']),
-                title=test_row['title'],
-                description=test_row['description'],
-                time_limit_minutes=test_row['time_limit_minutes'],
-                total_questions=test_row['num_questions'],
-                max_attempts=test_row['max_attempts'],
-                pass_threshold=test_row['pass_threshold'],
-                scheduled_start=test_row['scheduled_start'],
-                scheduled_end=test_row['scheduled_end'],
-                questions=[
-                    TestQuestionResponse(
-                        id=str(q['id']),
-                        question_text=q['question_text'],
-                        question_type=q['question_type'],
-                        options=q['options'],
-                        question_order=q['question_order']
-                    )
-                    for q in questions
-                ],
-                user_attempts=user_attempts,
-                user_best_score=user_best_score,
-                can_attempt=can_attempt
-            )
+            if performance_response.data:
+                performance = performance_response.data[0]
+                user_attempts = performance['attempts_count']
+                user_best_score = float(performance['best_score']) if performance['best_score'] else None
+                can_attempt = user_attempts < test_row['max_attempts']
+        
+        return TestDetailsResponse(
+            id=str(test_row['id']),
+            title=test_row['title'],
+            description=test_row['description'],
+            time_limit_minutes=test_row['time_limit_minutes'],
+            total_questions=test_row['num_questions'],
+            max_attempts=test_row['max_attempts'],
+            pass_threshold=test_row['pass_threshold'],
+            scheduled_start=test_row.get('scheduled_start'),
+            scheduled_end=test_row.get('scheduled_end'),
+            questions=[
+                TestQuestionResponse(
+                    id=str(q['id']),
+                    question_text=q['question_text'],
+                    question_type=q['question_type'],
+                    options=q['options'],
+                    question_order=q['question_order']
+                )
+                for q in questions
+            ],
+            user_attempts=user_attempts,
+            user_best_score=user_best_score,
+            can_attempt=can_attempt
+        )
             
     except HTTPException:
         raise
