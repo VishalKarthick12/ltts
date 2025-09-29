@@ -162,7 +162,8 @@ async def create_public_link(
         
         # Calculate expiration
         expires_at = None
-            expires_at = datetime.now(timezone.utc) + timedelta(days=link_data.expires_in_days)
+        
+        expires_at = datetime.now(timezone.utc) + timedelta(days=link_data.expires_in_days)
         
         # Generate unique link token
         link_token = secrets.token_urlsafe(16)
@@ -455,4 +456,3 @@ async def get_test_sharing_info(
     except Exception as e:
         logger.error(f"Error getting sharing info: {e}")
         raise HTTPException(status_code=500, detail="Error getting sharing info")
-
