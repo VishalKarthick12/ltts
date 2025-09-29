@@ -528,93 +528,111 @@ async def submit_test(
     Submit test answers and calculate score
     """
     try:
-        async with pool.acquire() as conn:
-            # Get test details
-            test_row = await conn.fetchrow("""
-                SELECT * FROM tests WHERE id = $1 AND is_active = true
-            """, test_id)
-            
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found or inactive")
-            
-            # Check if test is accessible
-            now = datetime.utcnow()
-            if test_row['scheduled_start'] and now < test_row['scheduled_start']:
+        # SUPABASE MIGRATION: Fix submit_test to use Supabase instead of pool
+        # Get test details
+        test_response = supabase.table('tests').select('*').eq('id', test_id).eq('is_active', True).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or inactive")
+        
+        test_row = test_response.data[0]
+        
+        # Check if test is accessible
+        now = datetime.utcnow()
+        scheduled_start = test_row.get('scheduled_start')
+        scheduled_end = test_row.get('scheduled_end')
+        
+        if scheduled_start:
+            if isinstance(scheduled_start, str):
+                scheduled_start = datetime.fromisoformat(scheduled_start.replace('Z', '+00:00'))
+            if now < scheduled_start:
                 raise HTTPException(status_code=403, detail="Test has not started yet")
-            if test_row['scheduled_end'] and now > test_row['scheduled_end']:
+                
+        if scheduled_end:
+            if isinstance(scheduled_end, str):
+                scheduled_end = datetime.fromisoformat(scheduled_end.replace('Z', '+00:00'))
+            if now > scheduled_end:
                 raise HTTPException(status_code=403, detail="Test has ended")
+        
+        # SUPABASE: Check user attempts if authenticated
+        if current_user:
+            attempts_response = supabase.table('user_performance').select('attempts_count').eq('user_id', current_user.id).eq('test_id', test_id).execute()
             
-            # Check user attempts if authenticated
-            if current_user:
-                attempts = await conn.fetchval("""
-                    SELECT attempts_count FROM user_performance
-                    WHERE user_id = $1 AND test_id = $2
-                """, current_user.id, test_id)
-                
-                if attempts and attempts >= test_row['max_attempts']:
-                    raise HTTPException(status_code=403, detail="Maximum attempts exceeded")
+            attempts = attempts_response.data[0]['attempts_count'] if attempts_response.data else 0
             
-            # Get correct answers
-            correct_answers = await conn.fetch("""
-                SELECT q.id, q.correct_answer
-                FROM test_questions tq
-                JOIN questions q ON tq.question_id = q.id
-                WHERE tq.test_id = $1
-            """, test_id)
+            if attempts and attempts >= test_row['max_attempts']:
+                raise HTTPException(status_code=403, detail="Maximum attempts exceeded")
             
-            correct_map = {str(row['id']): row['correct_answer'] for row in correct_answers}
+        # SUPABASE: Get correct answers with JOIN-like behavior
+        test_questions_response = supabase.table('test_questions').select('question_id').eq('test_id', test_id).execute()
+        
+        if not test_questions_response.data:
+            raise HTTPException(status_code=400, detail="No questions found for this test")
+        
+        question_ids = [tq['question_id'] for tq in test_questions_response.data]
+        questions_response = supabase.table('questions').select('id, correct_answer').in_('id', question_ids).execute()
+        
+        correct_map = {str(row['id']): row['correct_answer'] for row in questions_response.data} if questions_response.data else {}
+        
+        # Calculate score
+        correct_count = 0
+        question_results = []
+        
+        for answer in submission.answers:
+            is_correct = correct_map.get(answer.question_id, "").strip().lower() == answer.selected_answer.strip().lower()
+            if is_correct:
+                correct_count += 1
             
-            # Calculate score
-            correct_count = 0
-            question_results = []
-            
-            for answer in submission.answers:
-                is_correct = correct_map.get(answer.question_id, "").strip().lower() == answer.selected_answer.strip().lower()
-                if is_correct:
-                    correct_count += 1
-                
-                question_results.append({
-                    "question_id": answer.question_id,
-                    "selected_answer": answer.selected_answer,
-                    "correct_answer": correct_map.get(answer.question_id, ""),
-                    "is_correct": is_correct
-                })
-            
-            total_questions = len(correct_answers)
-            score = (correct_count / total_questions * 100) if total_questions > 0 else 0
-            is_passed = score >= test_row['pass_threshold']
-            
-            # Store submission
-            submission_id = str(uuid.uuid4())
-            import json
-            submission_row = await conn.fetchrow("""
-                INSERT INTO test_submissions (
-                    id, test_id, user_id, participant_name, participant_email,
-                    score, total_questions, correct_answers, time_taken_minutes,
-                    answers, submitted_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING *
-            """, 
-                submission_id, test_id, current_user.id if current_user else None,
-                submission.participant_name, submission.participant_email,
-                score, total_questions, correct_count, submission.time_taken_minutes,
-                json.dumps(question_results), now
-            )
-            
-            return TestSubmissionResponse(
-                id=str(submission_row['id']),
-                test_id=str(submission_row['test_id']),
-                test_title=test_row['title'],
-                participant_name=submission_row['participant_name'],
-                participant_email=submission_row['participant_email'],
-                score=float(submission_row['score']),
-                total_questions=submission_row['total_questions'],
-                correct_answers=submission_row['correct_answers'],
-                time_taken_minutes=submission_row['time_taken_minutes'],
-                is_passed=is_passed,
-                submitted_at=submission_row['submitted_at'],
-                question_results=question_results
-            )
+            question_results.append({
+                "question_id": answer.question_id,
+                "selected_answer": answer.selected_answer,
+                "correct_answer": correct_map.get(answer.question_id, ""),
+                "is_correct": is_correct
+            })
+        
+        total_questions = len(questions_response.data) if questions_response.data else 0
+        score = (correct_count / total_questions * 100) if total_questions > 0 else 0
+        is_passed = score >= test_row['pass_threshold']
+        
+        # SUPABASE: Store submission
+        submission_id = str(uuid.uuid4())
+        import json
+        submission_data = {
+            'id': submission_id,
+            'test_id': test_id,
+            'user_id': current_user.id if current_user else None,
+            'participant_name': submission.participant_name,
+            'participant_email': submission.participant_email,
+            'score': score,
+            'total_questions': total_questions,
+            'correct_answers': correct_count,
+            'time_taken_minutes': submission.time_taken_minutes,
+            'answers': json.dumps(question_results),
+            'submitted_at': now.isoformat(),
+            'is_passed': is_passed
+        }
+        
+        submission_response = supabase.table('test_submissions').insert(submission_data).execute()
+        
+        if not submission_response.data:
+            raise HTTPException(status_code=500, detail="Failed to store submission")
+        
+        submission_row = submission_response.data[0]
+        
+        return TestSubmissionResponse(
+            id=str(submission_row['id']),
+            test_id=str(submission_row['test_id']),
+            test_title=test_row['title'],
+            participant_name=submission_row['participant_name'],
+            participant_email=submission_row['participant_email'],
+            score=float(submission_row['score']),
+            total_questions=submission_row['total_questions'],
+            correct_answers=submission_row['correct_answers'],
+            time_taken_minutes=submission_row['time_taken_minutes'],
+            is_passed=is_passed,
+            submitted_at=datetime.fromisoformat(submission_row['submitted_at'].replace('Z', '+00:00')) if isinstance(submission_row['submitted_at'], str) else submission_row['submitted_at'],
+            question_results=question_results
+        )
             
     except HTTPException:
         raise
@@ -680,67 +698,79 @@ async def get_test_submissions(
     Get all submissions for a test (creator only)
     """
     try:
-        async with pool.acquire() as conn:
-            # Check if user is test creator (avoid UUID vs string mismatch)
-            is_creator = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
-            if not is_creator:
-                # Determine if it's a not found vs forbidden
-                exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1)", test_id)
-                if not exists:
-                    raise HTTPException(status_code=404, detail="Test not found")
-                raise HTTPException(status_code=403, detail="Not authorized to view submissions")
+        # SUPABASE MIGRATION: Fix get_test_submissions to use Supabase and match frontend expectations
+        # Check if user is test creator
+        is_creator_response = supabase.table('tests').select('id, title').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not is_creator_response.data:
+            # Check if test exists
+            test_exists_response = supabase.table('tests').select('id').eq('id', test_id).execute()
+            if not test_exists_response.data:
+                raise HTTPException(status_code=404, detail="Test not found")
+            raise HTTPException(status_code=403, detail="Not authorized to view submissions")
 
-            # Retrieve test title for response mapping
-            test_row = await conn.fetchrow("SELECT title FROM tests WHERE id = $1", test_id)
+        test_title = is_creator_response.data[0]['title']
+        
+        # SUPABASE: Get submissions with filters - start with base query
+        query = supabase.table('test_submissions').select('*').eq('test_id', test_id)
+        
+        # Apply date filters if provided
+        if start_date:
+            query = query.gte('submitted_at', start_date)
+        if end_date:
+            query = query.lte('submitted_at', end_date)
+        
+        # Apply ordering and pagination
+        submissions_response = query.order('submitted_at', desc=True).range(skip, skip + limit - 1).execute()
+        
+        if not submissions_response.data:
+            return []
+        
+        # Enrich submissions with user names and apply user filter if needed
+        enriched_submissions = []
+        for submission in submissions_response.data:
+            # Get user name if user_id exists
+            user_name = submission.get('participant_name', 'Anonymous')
+            if submission.get('user_id'):
+                user_response = supabase.table('users').select('name, email').eq('id', submission['user_id']).execute()
+                if user_response.data:
+                    user_data = user_response.data[0]
+                    user_name = user_data['name']
+                    # Update participant_email with actual user email if not set
+                    if not submission.get('participant_email'):
+                        submission['participant_email'] = user_data['email']
             
-            # Build dynamic filters
-            conditions = ["ts.test_id = $1"]
-            params = [test_id]
-            param_idx = 1
-            if start_date:
-                param_idx += 1
-                conditions.append(f"ts.submitted_at >= ${param_idx}")
-                params.append(start_date)
-            if end_date:
-                param_idx += 1
-                conditions.append(f"ts.submitted_at <= ${param_idx}")
-                params.append(end_date)
+            submission['user_name'] = user_name
+            
+            # Apply user filter in Python (since Supabase doesn't support complex text search easily)
             if user:
-                param_idx += 1
-                conditions.append(f"(LOWER(COALESCE(u.name, ts.participant_name)) LIKE ${param_idx} OR LOWER(COALESCE(u.email, ts.participant_email)) LIKE ${param_idx})")
-                params.append(f"%{user.lower()}%")
-
-            params.extend([skip, limit])
-
-            # Get submissions
-            query = f"""
-                SELECT ts.*, u.name as user_name
-                FROM test_submissions ts
-                LEFT JOIN users u ON ts.user_id = u.id
-                WHERE {' AND '.join(conditions)}
-                ORDER BY ts.submitted_at DESC
-                OFFSET ${param_idx + 1} LIMIT ${param_idx + 2}
-            """
-            submissions = await conn.fetch(query, *params)
+                user_lower = user.lower()
+                participant_name = (submission.get('participant_name') or '').lower()
+                participant_email = (submission.get('participant_email') or '').lower()
+                user_name_lower = user_name.lower()
+                
+                if not (user_lower in participant_name or user_lower in participant_email or user_lower in user_name_lower):
+                    continue
             
-            return [
-                TestSubmissionResponse(
-                    id=str(sub['id']),
-                    test_id=str(sub['test_id']),
-                    test_title=test_row['title'],
-                    participant_name=sub['participant_name'],
-                    participant_email=sub['participant_email'],
-                    score=float(sub['score']),
-                    total_questions=sub['total_questions'],
-                    correct_answers=sub['correct_answers'],
-                    time_taken_minutes=sub['time_taken_minutes'],
-                    is_passed=sub['is_passed'],
-                    submitted_at=sub['submitted_at']
-                )
-                for sub in submissions
-            ]
+            enriched_submissions.append(submission)
+        
+        # Return submissions in the expected format for frontend analytics
+        return [
+            TestSubmissionResponse(
+                id=str(sub['id']),
+                test_id=str(sub['test_id']),
+                test_title=test_title,
+                participant_name=sub['participant_name'],
+                participant_email=sub.get('participant_email'),
+                score=float(sub['score']),
+                total_questions=sub['total_questions'],
+                correct_answers=sub['correct_answers'],
+                time_taken_minutes=sub.get('time_taken_minutes'),
+                is_passed=sub['is_passed'],
+                submitted_at=datetime.fromisoformat(sub['submitted_at'].replace('Z', '+00:00')) if isinstance(sub['submitted_at'], str) else sub['submitted_at']
+            )
+            for sub in enriched_submissions
+        ]
             
     except HTTPException:
         raise
@@ -986,46 +1016,76 @@ async def get_test_leaderboard(
     supabase=Depends(get_supabase)
 ):
     try:
-        async with pool.acquire() as conn:
-            # Ensure creator
-            is_creator = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
-            if not is_creator:
-                raise HTTPException(status_code=403, detail="Not authorized")
+        # SUPABASE MIGRATION: Fix test leaderboard to use Supabase and match frontend expectations
+        # Check if user is test creator
+        is_creator_response = supabase.table('tests').select('id').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not is_creator_response.data:
+            raise HTTPException(status_code=403, detail="Not authorized")
 
-            rows = await conn.fetch("""
-                WITH ranked AS (
-                    SELECT 
-                        COALESCE(CAST(ts.user_id AS TEXT), ts.participant_email) as user_key,
-                        COALESCE(u.name, ts.participant_name) as name,
-                        COALESCE(u.email, ts.participant_email) as email,
-                        MAX(ts.score) as best_score,
-                        COUNT(*) as attempts,
-                        MAX(ts.submitted_at) as last_attempt
-                    FROM test_submissions ts
-                    LEFT JOIN users u ON ts.user_id = u.id
-                    WHERE ts.test_id = $1
-                    GROUP BY 
-                        COALESCE(CAST(ts.user_id AS TEXT), ts.participant_email),
-                        COALESCE(u.name, ts.participant_name),
-                        COALESCE(u.email, ts.participant_email)
-                )
-                SELECT * FROM ranked
-                ORDER BY best_score DESC, last_attempt DESC
-                LIMIT $2
-            """, test_id, limit)
+        # Get all submissions for this test
+        submissions_response = supabase.table('test_submissions').select('*').eq('test_id', test_id).execute()
+        
+        if not submissions_response.data:
+            return []
 
-            return [
-                {
-                    "name": r['name'],
-                    "email": r['email'],
-                    "best_score": float(r['best_score']) if r['best_score'] is not None else 0.0,
-                    "attempts": r['attempts'],
-                    "last_attempt": r['last_attempt']
+        # Group by user (user_id or participant_email) and calculate best scores
+        user_stats = {}
+        for submission in submissions_response.data:
+            # Use user_id if available, otherwise use participant_email as key
+            user_key = submission.get('user_id') or submission.get('participant_email')
+            if not user_key:
+                continue
+                
+            if user_key not in user_stats:
+                user_stats[user_key] = {
+                    'scores': [],
+                    'attempts': 0,
+                    'last_attempt': None,
+                    'name': submission.get('participant_name', 'Anonymous'),
+                    'email': submission.get('participant_email', ''),
+                    'user_id': submission.get('user_id')
                 }
-                for r in rows
-            ]
+            
+            stats = user_stats[user_key]
+            stats['scores'].append(submission.get('score', 0))
+            stats['attempts'] += 1
+            
+            submitted_at = submission.get('submitted_at')
+            if isinstance(submitted_at, str):
+                submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+            
+            if not stats['last_attempt'] or submitted_at > stats['last_attempt']:
+                stats['last_attempt'] = submitted_at
+
+        # Enrich with actual user data if user_id exists
+        leaderboard = []
+        for user_key, stats in user_stats.items():
+            name = stats['name']
+            email = stats['email']
+            
+            # If we have a user_id, get the actual user data
+            if stats['user_id']:
+                user_response = supabase.table('users').select('name, email').eq('id', stats['user_id']).execute()
+                if user_response.data:
+                    user_data = user_response.data[0]
+                    name = user_data['name']
+                    email = user_data['email']
+            
+            best_score = max(stats['scores']) if stats['scores'] else 0
+            
+            leaderboard.append({
+                "name": name,
+                "email": email,
+                "best_score": float(best_score),
+                "attempts": stats['attempts'],
+                "last_attempt": stats['last_attempt']
+            })
+
+        # Sort by best score descending, then by last attempt
+        leaderboard.sort(key=lambda x: (-x['best_score'], x['last_attempt'] or datetime.min), reverse=False)
+        
+        return leaderboard[:limit]
     except HTTPException:
         raise
     except Exception as e:

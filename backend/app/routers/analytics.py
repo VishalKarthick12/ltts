@@ -209,25 +209,65 @@ async def get_leaderboard(
     Get user leaderboard
     """
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT * FROM user_leaderboard
-                LIMIT $1
-            """, limit)
+        # SUPABASE MIGRATION: Calculate leaderboard from test_submissions and user_performance
+        # Since we don't have a materialized view, compute in Python
+        
+        # Get all users with their submission stats
+        all_submissions_response = supabase.table('test_submissions').select('user_id, score, is_passed, time_taken_minutes, test_id').execute()
+        
+        if not all_submissions_response.data:
+            return []
+        
+        # Group by user_id and calculate stats
+        user_stats = {}
+        for submission in all_submissions_response.data:
+            user_id = submission.get('user_id')
+            if not user_id:  # Skip anonymous submissions
+                continue
             
-            return [
-                LeaderboardEntry(
-                    user_id=str(row['user_id']),
-                    name=row['name'],
-                    email=row['email'],
-                    tests_taken=row['tests_taken'],
-                    average_best_score=float(row['average_best_score']),
-                    total_attempts=row['total_attempts'],
-                    total_time_minutes=row['total_time_minutes'],
-                    tests_passed=row['tests_passed']
-                )
-                for row in rows
-            ]
+            if user_id not in user_stats:
+                user_stats[user_id] = {
+                    'scores': [],
+                    'tests': set(),
+                    'total_attempts': 0,
+                    'total_time': 0,
+                    'tests_passed': 0
+                }
+            
+            stats = user_stats[user_id]
+            stats['scores'].append(submission.get('score', 0))
+            stats['tests'].add(submission.get('test_id'))
+            stats['total_attempts'] += 1
+            stats['total_time'] += submission.get('time_taken_minutes', 0) or 0
+            if submission.get('is_passed'):
+                stats['tests_passed'] += 1
+        
+        # Convert to leaderboard entries
+        leaderboard = []
+        for user_id, stats in user_stats.items():
+            # Get user details
+            user_response = supabase.table('users').select('name, email').eq('id', user_id).execute()
+            if not user_response.data:
+                continue
+            
+            user = user_response.data[0]
+            average_score = sum(stats['scores']) / len(stats['scores']) if stats['scores'] else 0
+            
+            leaderboard.append(LeaderboardEntry(
+                user_id=str(user_id),
+                name=user['name'],
+                email=user['email'],
+                tests_taken=len(stats['tests']),
+                average_best_score=float(average_score),
+                total_attempts=stats['total_attempts'],
+                total_time_minutes=stats['total_time'],
+                tests_passed=stats['tests_passed']
+            ))
+        
+        # Sort by average score descending
+        leaderboard.sort(key=lambda x: x.average_best_score, reverse=True)
+        
+        return leaderboard[:limit]
             
     except Exception as e:
         logger.error(f"Error fetching leaderboard: {e}")
@@ -244,48 +284,58 @@ async def get_recent_activity(
     Get recent test activity
     """
     try:
-        async with pool.acquire() as conn:
-            if test_id:
-                # Check if user is test creator
-                is_creator = await conn.fetchval("""
-                    SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-                """, test_id, current_user.id)
-                
-                if not is_creator:
-                    raise HTTPException(status_code=403, detail="Not authorized")
-                
-                query = """
-                    SELECT * FROM recent_test_activity
-                    WHERE test_id = $1
-                    LIMIT $2
-                """
-                params = [test_id, limit]
-            else:
-                # Show activity for all user's tests
-                query = """
-                    SELECT * FROM recent_test_activity
-                    WHERE test_id IN (SELECT id FROM tests WHERE created_by = $1)
-                    LIMIT $2
-                """
-                params = [current_user.id, limit]
+        # SUPABASE MIGRATION: Get recent activity using Supabase queries
+        if test_id:
+            # Check if user is test creator
+            is_creator_response = supabase.table('tests').select('id').eq('id', test_id).eq('created_by', current_user.id).execute()
             
-            rows = await conn.fetch(query, *params)
+            if not is_creator_response.data:
+                raise HTTPException(status_code=403, detail="Not authorized")
             
-            return [
-                RecentActivity(
-                    id=str(row['id']),
-                    test_id=str(row['test_id']),
-                    test_title=row['test_title'],
-                    participant_name=row['participant_name'],
-                    participant_email=row['participant_email'],
-                    user_name=row['user_name'],
-                    score=float(row['score']),
-                    is_passed=row['is_passed'],
-                    time_taken_minutes=row['time_taken_minutes'],
-                    submitted_at=row['submitted_at']
-                )
-                for row in rows
-            ]
+            # Get submissions for specific test
+            submissions_response = supabase.table('test_submissions').select('*').eq('test_id', test_id).order('submitted_at', desc=True).limit(limit).execute()
+        else:
+            # Get all user's tests first
+            user_tests_response = supabase.table('tests').select('id').eq('created_by', current_user.id).execute()
+            
+            if not user_tests_response.data:
+                return []
+            
+            user_test_ids = [test['id'] for test in user_tests_response.data]
+            
+            # Get submissions for all user's tests
+            submissions_response = supabase.table('test_submissions').select('*').in_('test_id', user_test_ids).order('submitted_at', desc=True).limit(limit).execute()
+        
+        if not submissions_response.data:
+            return []
+        
+        # Enrich submission data with test titles and user names
+        activities = []
+        for submission in submissions_response.data:
+            # Get test title
+            test_response = supabase.table('tests').select('title').eq('id', submission['test_id']).execute()
+            test_title = test_response.data[0]['title'] if test_response.data else 'Unknown Test'
+            
+            # Get user name if user_id exists
+            user_name = 'Anonymous'
+            if submission.get('user_id'):
+                user_response = supabase.table('users').select('name').eq('id', submission['user_id']).execute()
+                user_name = user_response.data[0]['name'] if user_response.data else 'Unknown'
+            
+            activities.append(RecentActivity(
+                id=str(submission['id']),
+                test_id=str(submission['test_id']),
+                test_title=test_title,
+                participant_name=submission.get('participant_name', 'Anonymous'),
+                participant_email=submission.get('participant_email'),
+                user_name=user_name,
+                score=float(submission.get('score', 0)),
+                is_passed=submission.get('is_passed', False),
+                time_taken_minutes=submission.get('time_taken_minutes'),
+                submitted_at=datetime.fromisoformat(submission['submitted_at'].replace('Z', '+00:00')) if isinstance(submission['submitted_at'], str) else submission['submitted_at']
+            ))
+        
+        return activities
             
     except HTTPException:
         raise
@@ -302,31 +352,66 @@ async def get_user_performance(
     Get current user's performance across all tests
     """
     try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT 
-                    up.*,
-                    t.title as test_title
-                FROM user_performance up
-                JOIN tests t ON up.test_id = t.id
-                WHERE up.user_id = $1
-                ORDER BY up.last_attempt_at DESC
-            """, current_user.id)
+        # SUPABASE MIGRATION: Calculate user performance from test_submissions
+        # Get all user's submissions
+        user_submissions_response = supabase.table('test_submissions').select('*').eq('user_id', current_user.id).order('submitted_at', desc=True).execute()
+        
+        if not user_submissions_response.data:
+            return []
+        
+        # Group submissions by test_id to calculate performance metrics
+        test_performance = {}
+        for submission in user_submissions_response.data:
+            test_id = submission['test_id']
             
-            return [
-                UserPerformance(
-                    user_id=str(row['user_id']),
-                    user_name=current_user.name,
-                    test_id=str(row['test_id']),
-                    test_title=row['test_title'],
-                    best_score=float(row['best_score']),
-                    attempts_count=row['attempts_count'],
-                    total_time_minutes=row['total_time_minutes'],
-                    first_attempt_at=row['first_attempt_at'],
-                    last_attempt_at=row['last_attempt_at']
-                )
-                for row in rows
-            ]
+            if test_id not in test_performance:
+                test_performance[test_id] = {
+                    'scores': [],
+                    'attempts': 0,
+                    'total_time': 0,
+                    'first_attempt': None,
+                    'last_attempt': None
+                }
+            
+            perf = test_performance[test_id]
+            perf['scores'].append(submission.get('score', 0))
+            perf['attempts'] += 1
+            perf['total_time'] += submission.get('time_taken_minutes', 0) or 0
+            
+            submitted_at = submission.get('submitted_at')
+            if isinstance(submitted_at, str):
+                submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+            
+            if not perf['first_attempt'] or submitted_at < perf['first_attempt']:
+                perf['first_attempt'] = submitted_at
+            if not perf['last_attempt'] or submitted_at > perf['last_attempt']:
+                perf['last_attempt'] = submitted_at
+        
+        # Convert to UserPerformance objects
+        performance_list = []
+        for test_id, perf in test_performance.items():
+            # Get test title
+            test_response = supabase.table('tests').select('title').eq('id', test_id).execute()
+            test_title = test_response.data[0]['title'] if test_response.data else 'Unknown Test'
+            
+            best_score = max(perf['scores']) if perf['scores'] else 0
+            
+            performance_list.append(UserPerformance(
+                user_id=str(current_user.id),
+                user_name=current_user.name,
+                test_id=str(test_id),
+                test_title=test_title,
+                best_score=float(best_score),
+                attempts_count=perf['attempts'],
+                total_time_minutes=perf['total_time'],
+                first_attempt_at=perf['first_attempt'],
+                last_attempt_at=perf['last_attempt']
+            ))
+        
+        # Sort by last attempt date descending
+        performance_list.sort(key=lambda x: x.last_attempt_at or datetime.min, reverse=True)
+        
+        return performance_list
             
     except Exception as e:
         logger.error(f"Error fetching user performance: {e}")

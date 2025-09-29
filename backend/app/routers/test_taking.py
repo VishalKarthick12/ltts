@@ -355,41 +355,51 @@ async def save_answer(
     Save/autosave an answer during test taking
     """
     try:
-        async with pool.acquire() as conn:
-            # Verify session
-            session = await conn.fetchrow("""
-                SELECT id, answers_draft, expires_at, is_active
-                FROM test_sessions
-                WHERE session_token = $1 AND is_active = true AND expires_at > NOW()
-            """, session_token)
-            
-            if not session:
-                raise HTTPException(status_code=403, detail="Invalid or expired session")
-            
-            # Update answers draft
-            answers_draft = session['answers_draft'] or {}
-            if isinstance(answers_draft, str):
-                answers_draft = json.loads(answers_draft)
-            
-            answers_draft[answer_data.question_id] = {
-                "selected_answer": answer_data.selected_answer,
-                "question_number": answer_data.question_number,
-                "saved_at": datetime.utcnow().isoformat()
-            }
-            
-            # Update session
-            await conn.execute("""
-                UPDATE test_sessions 
-                SET answers_draft = $1, current_question = $2
-                WHERE id = $3
-            """, json.dumps(answers_draft), answer_data.question_number, session['id'])
-            
-            return SaveAnswerResponse(
-                success=True,
-                question_number=answer_data.question_number,
-                answers_saved=len(answers_draft),
-                auto_saved_at=datetime.utcnow()
-            )
+        # SUPABASE MIGRATION: Fix save_answer to use Supabase instead of pool
+        # Verify session exists and is active
+        session_response = supabase.table('test_sessions').select('id, answers_draft, expires_at, is_active').eq('session_token', session_token).eq('is_active', True).execute()
+        
+        if not session_response.data:
+            raise HTTPException(status_code=403, detail="Invalid or expired session")
+        
+        session = session_response.data[0]
+        
+        # Check if session has expired (manual check since Supabase doesn't have NOW())
+        now = datetime.now(timezone.utc)
+        expires_at_str = session['expires_at']
+        if isinstance(expires_at_str, str):
+            expires_at_dt = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+            if now > expires_at_dt:
+                raise HTTPException(status_code=403, detail="Session has expired")
+        
+        # SUPABASE: Update answers draft - parse existing answers correctly
+        answers_draft = session['answers_draft'] or {}
+        if isinstance(answers_draft, str):
+            import json
+            answers_draft = json.loads(answers_draft)
+        
+        # Add new answer to draft with proper structure
+        answers_draft[answer_data.question_id] = {
+            "selected_answer": answer_data.selected_answer,
+            "question_number": answer_data.question_number,
+            "saved_at": now.isoformat()
+        }
+        
+        # SUPABASE: Update session with new answers_draft
+        update_response = supabase.table('test_sessions').update({
+            'answers_draft': json.dumps(answers_draft),
+            'current_question': answer_data.question_number
+        }).eq('id', session['id']).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=500, detail="Failed to save answer")
+        
+        return SaveAnswerResponse(
+            success=True,
+            question_number=answer_data.question_number,
+            answers_saved=len(answers_draft),
+            auto_saved_at=now
+        )
             
     except HTTPException:
         raise
