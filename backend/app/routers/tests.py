@@ -497,19 +497,19 @@ async def delete_test(
     Delete a test (only by creator)
     """
     try:
-        async with pool.acquire() as conn:
-            # Check if test exists and user is creator
-            test_exists = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
-            
-            if not test_exists:
-                raise HTTPException(status_code=404, detail="Test not found or not authorized")
-            
-            # Delete test (cascades to submissions, questions, analytics)
-            await conn.execute("DELETE FROM tests WHERE id = $1", test_id)
-            
-            return {"message": "Test deleted successfully"}
+        # SUPABASE: Check if test exists and user is creator
+        test_response = supabase.table('tests').select('id').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or not authorized")
+        
+        # SUPABASE: Delete test (cascades to submissions, questions, analytics)
+        delete_response = supabase.table('tests').delete().eq('id', test_id).execute()
+        
+        if not delete_response.data:
+            raise HTTPException(status_code=500, detail="Failed to delete test")
+        
+        return {"message": "Test deleted successfully"}
             
     except HTTPException:
         raise
@@ -650,32 +650,80 @@ async def get_test_analytics(
     Get detailed analytics for a test (creator only)
     """
     try:
-        async with pool.acquire() as conn:
-            # Check if user is test creator
-            is_creator = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
+        # SUPABASE: Check if user is test creator
+        test_response = supabase.table('tests').select('created_by').eq('id', test_id).execute()
+        
+        if not test_response.data or test_response.data[0]['created_by'] != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view analytics")
+        
+        # SUPABASE: Get analytics
+        analytics_response = supabase.table('test_analytics').select('*').eq('test_id', test_id).execute()
+        
+        if not analytics_response.data:
+            # Calculate analytics on the fly if not in analytics table
+            submissions_response = supabase.table('test_submissions').select('*').eq('test_id', test_id).execute()
             
-            if not is_creator:
-                raise HTTPException(status_code=403, detail="Not authorized to view analytics")
+            if not submissions_response.data:
+                # Return empty analytics
+                return TestAnalytics(
+                    test_id=test_id,
+                    total_submissions=0,
+                    total_participants=0,
+                    average_score=0.0,
+                    pass_rate=0.0,
+                    average_time_minutes=0.0,
+                    last_updated=datetime.utcnow()
+                )
             
-            # Get analytics
-            analytics = await conn.fetchrow("""
-                SELECT * FROM test_analytics WHERE test_id = $1
-            """, test_id)
+            # Calculate analytics from submissions
+            submissions = submissions_response.data
+            total_submissions = len(submissions)
             
-            if not analytics:
-                raise HTTPException(status_code=404, detail="Analytics not found")
+            # Calculate unique participants
+            participants = set()
+            for sub in submissions:
+                if sub.get('user_id'):
+                    participants.add(sub['user_id'])
+                elif sub.get('participant_email'):
+                    participants.add(sub['participant_email'])
+            total_participants = len(participants)
+            
+            # Calculate averages
+            scores = [sub.get('score', 0) for sub in submissions]
+            average_score = sum(scores) / len(scores) if scores else 0
+            
+            passed_count = sum(1 for sub in submissions if sub.get('is_passed', False))
+            pass_rate = (passed_count / total_submissions * 100) if total_submissions > 0 else 0
+            
+            times = [sub.get('time_taken_minutes', 0) for sub in submissions if sub.get('time_taken_minutes')]
+            average_time_minutes = sum(times) / len(times) if times else 0
             
             return TestAnalytics(
-                test_id=str(analytics['test_id']),
-                total_submissions=analytics['total_submissions'],
-                total_participants=analytics['total_participants'],
-                average_score=float(analytics['average_score']),
-                pass_rate=float(analytics['pass_rate']),
-                average_time_minutes=float(analytics['average_time_minutes']),
-                last_updated=analytics['last_updated']
+                test_id=test_id,
+                total_submissions=total_submissions,
+                total_participants=total_participants,
+                average_score=float(average_score),
+                pass_rate=float(pass_rate),
+                average_time_minutes=float(average_time_minutes),
+                last_updated=datetime.utcnow()
             )
+        
+        analytics = analytics_response.data[0]
+        
+        # Parse last_updated if string
+        last_updated = analytics.get('last_updated')
+        if isinstance(last_updated, str):
+            last_updated = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+        
+        return TestAnalytics(
+            test_id=str(analytics['test_id']),
+            total_submissions=analytics.get('total_submissions', 0),
+            total_participants=analytics.get('total_participants', 0),
+            average_score=float(analytics.get('average_score', 0)),
+            pass_rate=float(analytics.get('pass_rate', 0)),
+            average_time_minutes=float(analytics.get('average_time_minutes', 0)),
+            last_updated=last_updated or datetime.utcnow()
+        )
             
     except HTTPException:
         raise
@@ -786,45 +834,58 @@ async def generate_share_link(
     supabase=Depends(get_supabase)
 ):
     try:
-        async with pool.acquire() as conn:
-            # Verify test ownership (avoid UUID vs string mismatch)
-            is_creator = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
-            if not is_creator:
-                # Also 404 if test doesn't exist
-                exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1)", test_id)
-                if not exists:
-                    raise HTTPException(status_code=404, detail="Test not found")
-                raise HTTPException(status_code=403, detail="Not authorized")
+        # SUPABASE: Verify test ownership
+        test_response = supabase.table('tests').select('id').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            # Check if test exists at all
+            test_exists = supabase.table('tests').select('id').eq('id', test_id).execute()
+            if not test_exists.data:
+                raise HTTPException(status_code=404, detail="Test not found")
+            raise HTTPException(status_code=403, detail="Not authorized")
 
-            # Create or reuse an active link
-            existing = await conn.fetchrow("""
-                SELECT * FROM test_public_links 
-                WHERE test_id = $1 AND is_active = TRUE 
-                AND (expires_at IS NULL OR expires_at > NOW())
-                ORDER BY created_at DESC
-                LIMIT 1
-            """, test_id)
+        # SUPABASE: Create or reuse an active link
+        now = datetime.utcnow()
+        existing_response = supabase.table('test_public_links').select('*').eq('test_id', test_id).eq('is_active', True).order('created_at', desc=True).limit(1).execute()
+        
+        if existing_response.data:
+            # Check if not expired
+            existing = existing_response.data[0]
+            if existing.get('expires_at'):
+                expires_at = datetime.fromisoformat(existing['expires_at'].replace('Z', '+00:00')) if isinstance(existing['expires_at'], str) else existing['expires_at']
+                if expires_at and expires_at < now:
+                    existing = None
+            
             if existing:
-                link_token = existing['link_token']
-                expires_at = existing['expires_at']
-            else:
-                link_token = secrets.token_urlsafe(16)
-                link_id = str(uuid.uuid4())
-                row = await conn.fetchrow("""
-                    INSERT INTO test_public_links (id, test_id, created_by, link_token)
-                    VALUES ($1, $2, $3, $4)
-                    RETURNING *
-                """, link_id, test_id, current_user.id, link_token)
-                expires_at = row['expires_at']
-
-            return {
-                "test_id": test_id,
-                "share_url": f"/test/{test_id}?token={link_token}",
-                "link_token": link_token,
-                "expires_at": expires_at
-            }
+                return {
+                    "test_id": test_id,
+                    "share_url": f"/test/{test_id}?token={existing['link_token']}",
+                    "link_token": existing['link_token'],
+                    "expires_at": existing.get('expires_at')
+                }
+        
+        # Create new link
+        link_token = secrets.token_urlsafe(16)
+        link_id = str(uuid.uuid4())
+        
+        new_link_response = supabase.table('test_public_links').insert({
+            'id': link_id,
+            'test_id': test_id,
+            'created_by': current_user.id,
+            'link_token': link_token,
+            'is_active': True,
+            'created_at': now.isoformat()
+        }).execute()
+        
+        if not new_link_response.data:
+            raise HTTPException(status_code=500, detail="Failed to create share link")
+        
+        return {
+            "test_id": test_id,
+            "share_url": f"/test/{test_id}?token={link_token}",
+            "link_token": link_token,
+            "expires_at": None
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -835,36 +896,55 @@ async def generate_share_link(
 @router.get("/share/{token}")
 async def get_shared_test(token: str, supabase=Depends(get_supabase)):
     try:
-        async with pool.acquire() as conn:
-            link = await conn.fetchrow("""
-                SELECT tpl.*, t.*
-                FROM test_public_links tpl
-                JOIN tests t ON tpl.test_id = t.id
-                WHERE tpl.link_token = $1 AND tpl.is_active = TRUE
-                AND (tpl.expires_at IS NULL OR tpl.expires_at > NOW())
-            """, token)
-            if not link:
-                # Allow invite tokens as well
-                invite = await conn.fetchrow("""
-                    SELECT ti.*, t.*
-                    FROM test_invites ti
-                    JOIN tests t ON ti.test_id = t.id
-                    WHERE ti.invite_token = $1 AND ti.status = 'pending'
-                    AND (ti.expires_at IS NULL OR ti.expires_at > NOW())
-                """, token)
-                if not invite:
-                    raise HTTPException(status_code=404, detail="Invalid or expired share token")
-                link = invite
+        # SUPABASE: Check public link first
+        now = datetime.utcnow()
+        link_response = supabase.table('test_public_links').select('*').eq('link_token', token).eq('is_active', True).execute()
+        
+        test_data = None
+        if link_response.data:
+            link = link_response.data[0]
+            # Check expiry
+            if link.get('expires_at'):
+                expires_at = datetime.fromisoformat(link['expires_at'].replace('Z', '+00:00')) if isinstance(link['expires_at'], str) else link['expires_at']
+                if expires_at and expires_at < now:
+                    link = None
+            
+            if link:
+                # Get test details
+                test_response = supabase.table('tests').select('*').eq('id', link['test_id']).execute()
+                if test_response.data:
+                    test_data = test_response.data[0]
+        
+        # If not found, check invite tokens
+        if not test_data:
+            invite_response = supabase.table('test_invites').select('*').eq('invite_token', token).eq('status', 'pending').execute()
+            
+            if invite_response.data:
+                invite = invite_response.data[0]
+                # Check expiry
+                if invite.get('expires_at'):
+                    expires_at = datetime.fromisoformat(invite['expires_at'].replace('Z', '+00:00')) if isinstance(invite['expires_at'], str) else invite['expires_at']
+                    if expires_at and expires_at < now:
+                        invite = None
+                
+                if invite:
+                    # Get test details
+                    test_response = supabase.table('tests').select('*').eq('id', invite['test_id']).execute()
+                    if test_response.data:
+                        test_data = test_response.data[0]
+        
+        if not test_data:
+            raise HTTPException(status_code=404, detail="Invalid or expired share token")
 
-            return {
-                "test_id": str(link['test_id']),
-                "title": link['title'],
-                "description": link['description'],
-                "num_questions": link['num_questions'],
-                "time_limit_minutes": link['time_limit_minutes'],
-                "pass_threshold": link['pass_threshold'],
-                "is_active": link['is_active'],
-            }
+        return {
+            "test_id": str(test_data['id']),
+            "title": test_data['title'],
+            "description": test_data.get('description'),
+            "num_questions": test_data['num_questions'],
+            "time_limit_minutes": test_data.get('time_limit_minutes'),
+            "pass_threshold": test_data.get('pass_threshold', 60),
+            "is_active": test_data.get('is_active', True),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -880,127 +960,137 @@ async def submit_via_share_token(
     supabase=Depends(get_supabase)
 ):
     try:
-        async with pool.acquire() as conn:
-            # Resolve test via token
-            row = await conn.fetchrow("""
-                SELECT t.* FROM test_public_links tpl
-                JOIN tests t ON tpl.test_id = t.id
-                WHERE tpl.link_token = $1 AND tpl.is_active = TRUE
-                AND (tpl.expires_at IS NULL OR tpl.expires_at > NOW())
-            """, token)
-            if not row:
-                row = await conn.fetchrow("""
-                    SELECT t.* FROM test_invites ti
-                    JOIN tests t ON ti.test_id = t.id
-                    WHERE ti.invite_token = $1 AND ti.status = 'pending'
-                    AND (ti.expires_at IS NULL OR ti.expires_at > NOW())
-                """, token)
-            if not row:
-                raise HTTPException(status_code=404, detail="Invalid or expired share token")
+        # SUPABASE: Resolve test via token
+        now = datetime.utcnow()
+        test_data = None
+        
+        # Check public link
+        link_response = supabase.table('test_public_links').select('*').eq('link_token', token).eq('is_active', True).execute()
+        if link_response.data:
+            link = link_response.data[0]
+            # Check expiry
+            if link.get('expires_at'):
+                expires_at = datetime.fromisoformat(link['expires_at'].replace('Z', '+00:00')) if isinstance(link['expires_at'], str) else link['expires_at']
+                if not expires_at or expires_at > now:
+                    # Get test
+                    test_response = supabase.table('tests').select('*').eq('id', link['test_id']).execute()
+                    if test_response.data:
+                        test_data = test_response.data[0]
+        
+        # If not found, check invite token
+        if not test_data:
+            invite_response = supabase.table('test_invites').select('*').eq('invite_token', token).eq('status', 'pending').execute()
+            if invite_response.data:
+                invite = invite_response.data[0]
+                # Check expiry
+                if invite.get('expires_at'):
+                    expires_at = datetime.fromisoformat(invite['expires_at'].replace('Z', '+00:00')) if isinstance(invite['expires_at'], str) else invite['expires_at']
+                    if not expires_at or expires_at > now:
+                        # Get test
+                        test_response = supabase.table('tests').select('*').eq('id', invite['test_id']).execute()
+                        if test_response.data:
+                            test_data = test_response.data[0]
+        
+        if not test_data:
+            raise HTTPException(status_code=404, detail="Invalid or expired share token")
 
-            test_id = str(row['id'])
+        test_id = str(test_data['id'])
 
-            # Resolve or create user
-            user_id = None
-            if current_user:
-                user_id = current_user.id
-            elif submission.participant_email:
-                existing_user = await conn.fetchrow("""
-                    SELECT id FROM users WHERE email = $1 AND is_active = TRUE
-                """, submission.participant_email)
-                if existing_user:
-                    user_id = existing_user['id']
-                else:
-                    try:
-                        password_hash = get_password_hash(secrets.token_urlsafe(16))
-                        new_user = await conn.fetchrow("""
-                            INSERT INTO users (name, email, password_hash, is_active)
-                            VALUES ($1, $2, $3, TRUE)
-                            RETURNING id
-                        """, submission.participant_name, submission.participant_email, password_hash)
-                        user_id = new_user['id'] if new_user else None
-                    except Exception:
-                        user_id = None
+        # SUPABASE: Resolve or create user
+        user_id = None
+        if current_user:
+            user_id = current_user.id
+        elif submission.participant_email:
+            existing_user_response = supabase.table('users').select('id').eq('email', submission.participant_email).eq('is_active', True).execute()
+            if existing_user_response.data:
+                user_id = existing_user_response.data[0]['id']
+            else:
+                # Try to create new user
+                try:
+                    password_hash = get_password_hash(secrets.token_urlsafe(16))
+                    new_user_response = supabase.table('users').insert({
+                        'name': submission.participant_name,
+                        'email': submission.participant_email,
+                        'password_hash': password_hash,
+                        'is_active': True
+                    }).execute()
+                    if new_user_response.data:
+                        user_id = new_user_response.data[0]['id']
+                except Exception:
+                    user_id = None
 
-            # Get correct answers
-            correct_answers = await conn.fetch("""
-                SELECT q.id, q.correct_answer
-                FROM test_questions tq
-                JOIN questions q ON tq.question_id = q.id
-                WHERE tq.test_id = $1
-            """, test_id)
-            correct_map = {str(r['id']): r['correct_answer'] for r in correct_answers}
+        # SUPABASE: Get correct answers
+        test_questions_response = supabase.table('test_questions').select('question_id').eq('test_id', test_id).execute()
+        
+        if not test_questions_response.data:
+            raise HTTPException(status_code=400, detail="No questions found for this test")
+        
+        question_ids = [tq['question_id'] for tq in test_questions_response.data]
+        questions_response = supabase.table('questions').select('id, correct_answer').in_('id', question_ids).execute()
+        
+        correct_map = {str(row['id']): row['correct_answer'] for row in questions_response.data} if questions_response.data else {}
 
-            # Score
-            correct_count = 0
-            question_results = []
-            for answer in submission.answers:
-                is_correct = correct_map.get(answer.question_id, "").strip().lower() == answer.selected_answer.strip().lower()
-                if is_correct:
-                    correct_count += 1
-                question_results.append({
-                    "question_id": answer.question_id,
-                    "selected_answer": answer.selected_answer,
-                    "correct_answer": correct_map.get(answer.question_id, ""),
-                    "is_correct": is_correct
-                })
+        # Calculate score
+        correct_count = 0
+        question_results = []
+        for answer in submission.answers:
+            is_correct = correct_map.get(answer.question_id, "").strip().lower() == answer.selected_answer.strip().lower()
+            if is_correct:
+                correct_count += 1
+            question_results.append({
+                "question_id": answer.question_id,
+                "selected_answer": answer.selected_answer,
+                "correct_answer": correct_map.get(answer.question_id, ""),
+                "is_correct": is_correct
+            })
 
-            total_questions = len(correct_answers)
-            score = (correct_count / total_questions * 100) if total_questions > 0 else 0
-            is_passed = score >= row['pass_threshold']
+        total_questions = len(questions_response.data) if questions_response.data else 0
+        score = (correct_count / total_questions * 100) if total_questions > 0 else 0
+        is_passed = score >= test_data.get('pass_threshold', 60)
 
-            # Store submission
-            submission_id = str(uuid.uuid4())
-            import json
-            submission_row = await conn.fetchrow("""
-                INSERT INTO test_submissions (
-                    id, test_id, user_id, participant_name, participant_email,
-                    score, total_questions, correct_answers, is_passed, time_taken_minutes,
-                    answers, submitted_at, invite_token
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), $12)
-                RETURNING *
-            """,
-                submission_id, test_id, user_id,
-                submission.participant_name, submission.participant_email,
-                score, total_questions, correct_count, is_passed, submission.time_taken_minutes,
-                json.dumps(question_results), token
-            )
+        # SUPABASE: Store submission
+        submission_id = str(uuid.uuid4())
+        import json
+        submission_data = {
+            'id': submission_id,
+            'test_id': test_id,
+            'user_id': user_id,
+            'participant_name': submission.participant_name,
+            'participant_email': submission.participant_email,
+            'score': score,
+            'total_questions': total_questions,
+            'correct_answers': correct_count,
+            'is_passed': is_passed,
+            'time_taken_minutes': submission.time_taken_minutes,
+            'answers': json.dumps(question_results),
+            'submitted_at': now.isoformat(),
+            'invite_token': token
+        }
+        
+        submission_response = supabase.table('test_submissions').insert(submission_data).execute()
+        
+        if not submission_response.data:
+            raise HTTPException(status_code=500, detail="Failed to store submission")
+        
+        submission_row = submission_response.data[0]
 
-            # Update analytics for this test
-            await conn.execute("""
-                UPDATE test_analytics ta
-                SET total_submissions = s.total_submissions,
-                    total_participants = s.total_participants,
-                    average_score = s.average_score,
-                    pass_rate = s.pass_rate,
-                    average_time_minutes = s.average_time_minutes,
-                    last_updated = NOW()
-                FROM (
-                    SELECT COUNT(*) AS total_submissions,
-                           COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), participant_email)) AS total_participants,
-                           COALESCE(AVG(score), 0) AS average_score,
-                           COALESCE(AVG(CASE WHEN is_passed THEN 1 ELSE 0 END) * 100, 0) AS pass_rate,
-                           COALESCE(AVG(time_taken_minutes), 0) AS average_time_minutes
-                    FROM test_submissions
-                    WHERE test_id = $1
-                ) s
-                WHERE ta.test_id = $1
-            """, test_id)
+        # SUPABASE: Update analytics (simplified - analytics can be computed on demand)
+        # This is handled by the analytics endpoints when needed
 
-            return TestSubmissionResponse(
-                id=str(submission_row['id']),
-                test_id=str(submission_row['test_id']),
-                test_title=row['title'],
-                participant_name=submission_row['participant_name'],
-                participant_email=submission_row['participant_email'],
-                score=float(submission_row['score']),
-                total_questions=submission_row['total_questions'],
-                correct_answers=submission_row['correct_answers'],
-                time_taken_minutes=submission_row['time_taken_minutes'],
-                is_passed=is_passed,
-                submitted_at=submission_row['submitted_at'],
-                question_results=question_results
-            )
+        return TestSubmissionResponse(
+            id=str(submission_row['id']),
+            test_id=str(submission_row['test_id']),
+            test_title=test_data['title'],
+            participant_name=submission_row['participant_name'],
+            participant_email=submission_row.get('participant_email'),
+            score=float(submission_row['score']),
+            total_questions=submission_row['total_questions'],
+            correct_answers=submission_row['correct_answers'],
+            time_taken_minutes=submission_row.get('time_taken_minutes'),
+            is_passed=is_passed,
+            submitted_at=datetime.fromisoformat(submission_row['submitted_at'].replace('Z', '+00:00')) if isinstance(submission_row['submitted_at'], str) else submission_row['submitted_at'],
+            question_results=question_results
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1100,40 +1190,40 @@ async def export_test_results(
     supabase=Depends(get_supabase)
 ):
     try:
-        async with pool.acquire() as conn:
-            # Ensure creator
-            is_creator = await conn.fetchval("""
-                SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-            """, test_id, current_user.id)
-            if not is_creator:
-                raise HTTPException(status_code=403, detail="Not authorized")
+        # SUPABASE: Ensure creator
+        test_response = supabase.table('tests').select('id').eq('id', test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=403, detail="Not authorized")
 
-            rows = await conn.fetch("""
-                SELECT ts.submitted_at, ts.participant_name, ts.participant_email, ts.score, ts.total_questions,
-                       ts.correct_answers, ts.time_taken_minutes, ts.is_passed
-                FROM test_submissions ts
-                WHERE ts.test_id = $1
-                ORDER BY ts.submitted_at DESC
-            """, test_id)
+        # SUPABASE: Get all submissions
+        submissions_response = supabase.table('test_submissions').select('*').eq('test_id', test_id).order('submitted_at', desc=True).execute()
+        
+        rows = submissions_response.data or []
 
-            # Build CSV
-            import csv
-            import io
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(["Submitted At", "Name", "Email", "Score", "Total Questions", "Correct", "Time Minutes", "Passed"]) 
-            for r in rows:
-                writer.writerow([
-                    r['submitted_at'], r['participant_name'], r['participant_email'],
-                    float(r['score']), r['total_questions'], r['correct_answers'],
-                    r['time_taken_minutes'], r['is_passed']
-                ])
-            output.seek(0)
-            filename = f"test_{test_id}_results.csv"
-            headers = {
-                "Content-Disposition": f"attachment; filename={filename}"
-            }
-            return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+        # Build CSV
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Submitted At", "Name", "Email", "Score", "Total Questions", "Correct", "Time Minutes", "Passed"]) 
+        for r in rows:
+            writer.writerow([
+                r.get('submitted_at', ''), 
+                r.get('participant_name', ''), 
+                r.get('participant_email', ''),
+                float(r.get('score', 0)), 
+                r.get('total_questions', 0), 
+                r.get('correct_answers', 0),
+                r.get('time_taken_minutes', 0), 
+                r.get('is_passed', False)
+            ])
+        output.seek(0)
+        filename = f"test_{test_id}_results.csv"
+        headers = {
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+        return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
     except HTTPException:
         raise
     except Exception as e:

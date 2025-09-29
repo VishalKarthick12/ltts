@@ -77,58 +77,64 @@ async def create_test_invites(
     Create invites for specific users to take a test
     """
     try:
-        async with pool.acquire() as conn:
-            # Verify test exists and user is creator
-            test_row = await conn.fetchrow("""
-                SELECT title, created_by FROM tests 
-                WHERE id = $1 AND created_by = $2
-            """, invite_data.test_id, current_user.id)
+        # SUPABASE: Verify test exists and user is creator
+        test_response = supabase.table('tests').select('title, created_by').eq('id', invite_data.test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or not authorized")
+        
+        test_row = test_response.data[0]
+        
+        # Calculate expiration
+        expires_at = None
+        if invite_data.expires_in_days:
+            expires_at = datetime.now(timezone.utc) + timedelta(days=invite_data.expires_in_days)
+        
+        invites = []
+        for email in invite_data.invite_emails:
+            # SUPABASE: Check if user exists
+            invited_user_response = supabase.table('users').select('id').eq('email', email).eq('is_active', True).execute()
+            invited_user = invited_user_response.data[0] if invited_user_response.data else None
             
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found or not authorized")
+            # Generate unique invite token
+            invite_token = secrets.token_urlsafe(32)
+            invite_id = str(uuid.uuid4())
             
-            # Calculate expiration
-            expires_at = None
-            if invite_data.expires_in_days:
-                expires_at = datetime.now(timezone.utc) + timedelta(days=invite_data.expires_in_days)
+            # SUPABASE: Create invite
+            invite_data_to_insert = {
+                'id': invite_id,
+                'test_id': invite_data.test_id,
+                'created_by': current_user.id,
+                'invited_user_id': invited_user['id'] if invited_user else None,
+                'invited_email': email,
+                'invite_token': invite_token,
+                'invite_type': 'email',
+                'message': invite_data.message,
+                'expires_at': expires_at.isoformat() if expires_at else None,
+                'status': 'pending',
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }
             
-            invites = []
-            for email in invite_data.invite_emails:
-                # Check if user exists
-                invited_user = await conn.fetchrow("""
-                    SELECT id FROM users WHERE email = $1 AND is_active = true
-                """, email)
-                
-                # Generate unique invite token
-                invite_token = secrets.token_urlsafe(32)
-                invite_id = str(uuid.uuid4())
-                
-                # Create invite
-                invite_row = await conn.fetchrow("""
-                    INSERT INTO test_invites (
-                        id, test_id, created_by, invited_user_id, invited_email,
-                        invite_token, invite_type, message, expires_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    RETURNING *
-                """, 
-                    invite_id, invite_data.test_id, current_user.id,
-                    invited_user['id'] if invited_user else None, email,
-                    invite_token, 'email', invite_data.message, expires_at
-                )
-                
-                invites.append(InviteResponse(
-                    id=str(invite_row['id']),
-                    test_id=str(invite_row['test_id']),
-                    test_title=test_row['title'],
-                    invited_email=invite_row['invited_email'],
-                    invite_token=invite_row['invite_token'],
-                    invite_url=f"/test/invite/{invite_row['invite_token']}",
-                    status=invite_row['status'],
-                    expires_at=invite_row['expires_at'],
-                    created_at=invite_row['created_at']
-                ))
+            invite_response = supabase.table('test_invites').insert(invite_data_to_insert).execute()
             
-            return invites
+            if not invite_response.data:
+                continue  # Skip failed invites
+            
+            invite_row = invite_response.data[0]
+            
+            invites.append(InviteResponse(
+                id=str(invite_row['id']),
+                test_id=str(invite_row['test_id']),
+                test_title=test_row['title'],
+                invited_email=invite_row['invited_email'],
+                invite_token=invite_row['invite_token'],
+                invite_url=f"/test/invite/{invite_row['invite_token']}",
+                status=invite_row['status'],
+                expires_at=datetime.fromisoformat(invite_row['expires_at'].replace('Z', '+00:00')) if invite_row.get('expires_at') and isinstance(invite_row['expires_at'], str) else invite_row.get('expires_at'),
+                created_at=datetime.fromisoformat(invite_row['created_at'].replace('Z', '+00:00')) if isinstance(invite_row['created_at'], str) else invite_row['created_at']
+            ))
+        
+        return invites
             
     except HTTPException:
         raise
@@ -146,48 +152,54 @@ async def create_public_link(
     Create a public shareable link for a test
     """
     try:
-        async with pool.acquire() as conn:
-            # Verify test exists and user is creator
-            test_row = await conn.fetchrow("""
-                SELECT title, created_by FROM tests 
-                WHERE id = $1 AND created_by = $2
-            """, link_data.test_id, current_user.id)
-            
-            if not test_row:
-                raise HTTPException(status_code=404, detail="Test not found or not authorized")
-            
-            # Calculate expiration
-            expires_at = None
-            if link_data.expires_in_days:
-                expires_at = datetime.now(timezone.utc) + timedelta(days=link_data.expires_in_days)
-            
-            # Generate unique link token
-            link_token = secrets.token_urlsafe(16)
-            link_id = str(uuid.uuid4())
-            
-            # Create public link
-            link_row = await conn.fetchrow("""
-                INSERT INTO test_public_links (
-                    id, test_id, created_by, link_token, max_uses, expires_at
-                ) VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING *
-            """, 
-                link_id, link_data.test_id, current_user.id,
-                link_token, link_data.max_uses, expires_at
-            )
-            
-            return PublicLinkResponse(
-                id=str(link_row['id']),
-                test_id=str(link_row['test_id']),
-                test_title=test_row['title'],
-                link_token=link_row['link_token'],
-                public_url=f"/test/public/{link_row['link_token']}",
-                is_active=link_row['is_active'],
-                max_uses=link_row['max_uses'],
-                current_uses=link_row['current_uses'],
-                expires_at=link_row['expires_at'],
-                created_at=link_row['created_at']
-            )
+        # SUPABASE: Verify test exists and user is creator
+        test_response = supabase.table('tests').select('title, created_by').eq('id', link_data.test_id).eq('created_by', current_user.id).execute()
+        
+        if not test_response.data:
+            raise HTTPException(status_code=404, detail="Test not found or not authorized")
+        
+        test_row = test_response.data[0]
+        
+        # Calculate expiration
+        expires_at = None
+            expires_at = datetime.now(timezone.utc) + timedelta(days=link_data.expires_in_days)
+        
+        # Generate unique link token
+        link_token = secrets.token_urlsafe(16)
+        link_id = str(uuid.uuid4())
+        
+        # SUPABASE: Create public link
+        link_data_to_insert = {
+            'id': link_id,
+            'test_id': link_data.test_id,
+            'created_by': current_user.id,
+            'link_token': link_token,
+            'max_uses': link_data.max_uses,
+            'expires_at': expires_at.isoformat() if expires_at else None,
+            'is_active': True,
+            'current_uses': 0,
+            'created_at': datetime.now(timezone.utc).isoformat()
+        }
+        
+        link_response = await supabase.table('test_public_links').insert(link_data_to_insert).execute()
+        
+        if not link_response.data:
+            raise HTTPException(status_code=500, detail=\"Failed to create public link\")
+        
+        link_row = link_response.data[0]
+        
+        return PublicLinkResponse(
+            id=str(link_row['id']),
+            test_id=str(link_row['test_id']),
+            test_title=test_row['title'],
+            link_token=link_row['link_token'],
+            public_url=f\"/test/public/{link_row['link_token']}\",
+            is_active=link_row.get('is_active', True),
+            max_uses=link_row.get('max_uses'),
+            current_uses=link_row.get('current_uses', 0),
+            expires_at=datetime.fromisoformat(link_row['expires_at'].replace('Z', '+00:00')) if link_row.get('expires_at') and isinstance(link_row['expires_at'], str) else link_row.get('expires_at'),
+            created_at=datetime.fromisoformat(link_row['created_at'].replace('Z', '+00:00')) if isinstance(link_row['created_at'], str) else link_row['created_at']
+        )
             
     except HTTPException:
         raise

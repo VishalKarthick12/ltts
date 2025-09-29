@@ -310,34 +310,55 @@ async def get_session_status(
     Get current session status including time remaining
     """
     try:
-        async with pool.acquire() as conn:
-            # Cleanup expired sessions first
-            await conn.execute("SELECT cleanup_expired_sessions()")
-            
-            session = await conn.fetchrow("""
-                SELECT * FROM active_test_sessions
-                WHERE session_token = $1
-            """, session_token)
-            
-            if not session:
-                raise HTTPException(status_code=404, detail="Session not found or expired")
-            
-            # Count saved answers
-            answers_draft = session['answers_draft'] or {}
-            if isinstance(answers_draft, str):
-                answers_draft = json.loads(answers_draft)
-            
-            answers_saved = len(answers_draft)
-            can_submit = answers_saved >= session['num_questions']  # All questions answered
-            
-            return TestSessionStatus(
-                session_id=str(session['id']),
-                is_active=session['is_active'],
-                current_question=session['current_question'],
-                minutes_remaining=max(0, session['minutes_remaining']),
-                answers_saved=answers_saved,
-                can_submit=can_submit
-            )
+        # SUPABASE: Get session status without pool
+        now = datetime.now(timezone.utc)
+        
+        # First cleanup expired sessions by updating them
+        supabase.table('test_sessions').update({
+            'is_active': False
+        }).lt('expires_at', now.isoformat()).execute()
+        
+        # Get session details
+        session_response = supabase.table('test_sessions').select('*').eq('session_token', session_token).eq('is_active', True).execute()
+        
+        if not session_response.data:
+            raise HTTPException(status_code=404, detail="Session not found or expired")
+        
+        session = session_response.data[0]
+        
+        # Check if expired
+        expires_at = datetime.fromisoformat(session['expires_at'].replace('Z', '+00:00')) if isinstance(session['expires_at'], str) else session['expires_at']
+        if now > expires_at:
+            # Mark as inactive
+            supabase.table('test_sessions').update({'is_active': False}).eq('id', session['id']).execute()
+            raise HTTPException(status_code=404, detail="Session expired")
+        
+        # Get test details for num_questions
+        test_response = supabase.table('tests').select('num_questions').eq('id', session['test_id']).execute()
+        num_questions = test_response.data[0]['num_questions'] if test_response.data else 10
+        
+        # Count saved answers
+        answers_draft = session.get('answers_draft') or {}
+        if isinstance(answers_draft, str):
+            answers_draft = json.loads(answers_draft)
+        
+        answers_saved = len(answers_draft)
+        can_submit = answers_saved >= num_questions  # All questions answered
+        
+        # Calculate time remaining
+        started_at = datetime.fromisoformat(session['started_at'].replace('Z', '+00:00')) if isinstance(session['started_at'], str) else session['started_at']
+        time_elapsed = (now - started_at).total_seconds() / 60  # in minutes
+        time_limit = session.get('time_limit_minutes') or 60
+        minutes_remaining = max(0, time_limit - time_elapsed)
+        
+        return TestSessionStatus(
+            session_id=str(session['id']),
+            is_active=session['is_active'],
+            current_question=session.get('current_question', 1),
+            minutes_remaining=minutes_remaining,
+            answers_saved=answers_saved,
+            can_submit=can_submit
+        )
             
     except HTTPException:
         raise
@@ -606,56 +627,64 @@ async def get_submission_result(
     Get detailed submission results
     """
     try:
-        async with pool.acquire() as conn:
-            # Get submission with test details
-            submission = await conn.fetchrow("""
-                SELECT ts.*, t.title as test_title, t.pass_threshold
-                FROM test_submissions ts
-                JOIN tests t ON ts.test_id = t.id
-                WHERE ts.id = $1
-            """, submission_id)
+        # SUPABASE: Get submission with test details
+        submission_response = supabase.table('test_submissions').select('*').eq('id', submission_id).execute()
+        
+        if not submission_response.data:
+            raise HTTPException(status_code=404, detail="Submission not found")
+        
+        submission = submission_response.data[0]
+        
+        # Get test details
+        test_response = supabase.table('tests').select('title, pass_threshold').eq('id', submission['test_id']).execute()
+        if test_response.data:
+            test = test_response.data[0]
+            submission['test_title'] = test['title']
+            submission['pass_threshold'] = test['pass_threshold']
+        else:
+            submission['test_title'] = 'Unknown Test'
+            submission['pass_threshold'] = 60
+        
+        # Security check - allow access to:
+        # 1. Own submissions (by user_id)
+        # 2. Test creator
+        # 3. Participant by email (for shared tests where user_id might be null)
+        if current_user:
+            is_own_submission = submission.get('user_id') == current_user.id
+            is_own_by_email = submission.get('participant_email') == current_user.email
             
-            if not submission:
-                raise HTTPException(status_code=404, detail="Submission not found")
-            
-            # Security check - allow access to:
-            # 1. Own submissions (by user_id)
-            # 2. Test creator
-            # 3. Participant by email (for shared tests where user_id might be null)
-            if current_user:
-                is_own_submission = submission['user_id'] == current_user.id
-                is_own_by_email = submission['participant_email'] == current_user.email
-                
-                if not (is_own_submission or is_own_by_email):
-                    # Check if user is test creator
-                    is_creator = await conn.fetchval("""
-                        SELECT EXISTS(SELECT 1 FROM tests WHERE id = $1 AND created_by = $2)
-                    """, submission['test_id'], current_user.id)
-                    
-                    if not is_creator:
-                        raise HTTPException(status_code=403, detail="Not authorized to view this submission")
-            
-            # Parse answers
-            answers_data = submission['answers']
-            if isinstance(answers_data, str):
-                answers_data = json.loads(answers_data)
-            
-            is_passed = submission['score'] >= submission['pass_threshold']
-            
-            return TestSubmissionResponse(
-                id=str(submission['id']),
-                test_id=str(submission['test_id']),
-                test_title=submission['test_title'],
-                participant_name=submission['participant_name'],
-                participant_email=submission['participant_email'],
-                score=float(submission['score']),
-                total_questions=submission['total_questions'],
-                correct_answers=submission['correct_answers'],
-                time_taken_minutes=submission['time_taken_minutes'],
-                is_passed=is_passed,
-                submitted_at=submission['submitted_at'],
-                question_results=answers_data
-            )
+            if not (is_own_submission or is_own_by_email):
+                # Check if user is test creator
+                creator_response = supabase.table('tests').select('created_by').eq('id', submission['test_id']).execute()
+                if not creator_response.data or creator_response.data[0]['created_by'] != current_user.id:
+                    raise HTTPException(status_code=403, detail="Not authorized to view this submission")
+        
+        # Parse answers
+        answers_data = submission.get('answers', [])
+        if isinstance(answers_data, str):
+            answers_data = json.loads(answers_data)
+        
+        is_passed = submission.get('score', 0) >= submission['pass_threshold']
+        
+        # Parse submitted_at if string
+        submitted_at = submission.get('submitted_at')
+        if isinstance(submitted_at, str):
+            submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+        
+        return TestSubmissionResponse(
+            id=str(submission['id']),
+            test_id=str(submission['test_id']),
+            test_title=submission['test_title'],
+            participant_name=submission.get('participant_name', 'Anonymous'),
+            participant_email=submission.get('participant_email'),
+            score=float(submission.get('score', 0)),
+            total_questions=submission.get('total_questions', 0),
+            correct_answers=submission.get('correct_answers', 0),
+            time_taken_minutes=submission.get('time_taken_minutes'),
+            is_passed=is_passed,
+            submitted_at=submitted_at,
+            question_results=answers_data
+        )
             
     except HTTPException:
         raise
@@ -673,41 +702,50 @@ async def get_result_by_email(
     Get the latest submission result for a participant by email (for shared tests)
     """
     try:
-        async with pool.acquire() as conn:
-            # Get the most recent submission for this test and email
-            submission = await conn.fetchrow("""
-                SELECT ts.*, t.title as test_title, t.pass_threshold
-                FROM test_submissions ts
-                JOIN tests t ON ts.test_id = t.id
-                WHERE ts.test_id = $1 AND LOWER(ts.participant_email) = LOWER($2)
-                ORDER BY ts.submitted_at DESC
-                LIMIT 1
-            """, test_id, participant_email)
-            
-            if not submission:
-                raise HTTPException(status_code=404, detail="No results found for this email and test")
-            
-            # Parse answers
-            answers_data = submission['answers']
-            if isinstance(answers_data, str):
-                answers_data = json.loads(answers_data)
-            
-            is_passed = submission['score'] >= submission['pass_threshold']
-            
-            return TestSubmissionResponse(
-                id=str(submission['id']),
-                test_id=str(submission['test_id']),
-                test_title=submission['test_title'],
-                participant_name=submission['participant_name'],
-                participant_email=submission['participant_email'],
-                score=float(submission['score']),
-                total_questions=submission['total_questions'],
-                correct_answers=submission['correct_answers'],
-                time_taken_minutes=submission['time_taken_minutes'],
-                is_passed=is_passed,
-                submitted_at=submission['submitted_at'],
-                question_results=answers_data
-            )
+        # SUPABASE: Get the most recent submission for this test and email
+        submissions_response = supabase.table('test_submissions').select('*').eq('test_id', test_id).ilike('participant_email', participant_email).order('submitted_at', desc=True).limit(1).execute()
+        
+        if not submissions_response.data:
+            raise HTTPException(status_code=404, detail="No results found for this email and test")
+        
+        submission = submissions_response.data[0]
+        
+        # Get test details
+        test_response = supabase.table('tests').select('title, pass_threshold').eq('id', test_id).execute()
+        if test_response.data:
+            test = test_response.data[0]
+            submission['test_title'] = test['title']
+            submission['pass_threshold'] = test['pass_threshold']
+        else:
+            submission['test_title'] = 'Unknown Test'
+            submission['pass_threshold'] = 60
+        
+        # Parse answers
+        answers_data = submission.get('answers', [])
+        if isinstance(answers_data, str):
+            answers_data = json.loads(answers_data)
+        
+        is_passed = submission.get('score', 0) >= submission['pass_threshold']
+        
+        # Parse submitted_at if string
+        submitted_at = submission.get('submitted_at')
+        if isinstance(submitted_at, str):
+            submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+        
+        return TestSubmissionResponse(
+            id=str(submission['id']),
+            test_id=str(submission['test_id']),
+            test_title=submission['test_title'],
+            participant_name=submission.get('participant_name', 'Anonymous'),
+            participant_email=submission.get('participant_email'),
+            score=float(submission.get('score', 0)),
+            total_questions=submission.get('total_questions', 0),
+            correct_answers=submission.get('correct_answers', 0),
+            time_taken_minutes=submission.get('time_taken_minutes'),
+            is_passed=is_passed,
+            submitted_at=submitted_at,
+            question_results=answers_data
+        )
             
     except HTTPException:
         raise
@@ -727,31 +765,47 @@ async def get_user_attempts(
         raise HTTPException(status_code=401, detail="Authentication required")
     
     try:
-        async with pool.acquire() as conn:
-            submissions = await conn.fetch("""
-                SELECT ts.*, t.title as test_title, t.pass_threshold
-                FROM test_submissions ts
-                JOIN tests t ON ts.test_id = t.id
-                WHERE ts.user_id = $1
-                ORDER BY ts.submitted_at DESC
-            """, current_user.id)
+        # SUPABASE: Get all test attempts for the current user
+        submissions_response = supabase.table('test_submissions').select('*').eq('user_id', current_user.id).order('submitted_at', desc=True).execute()
+        
+        if not submissions_response.data:
+            return []
+        
+        # Enrich with test details
+        result = []
+        for sub in submissions_response.data:
+            # Get test details
+            test_response = supabase.table('tests').select('title, pass_threshold').eq('id', sub['test_id']).execute()
+            if test_response.data:
+                test = test_response.data[0]
+                sub['test_title'] = test['title']
+                sub['pass_threshold'] = test['pass_threshold']
+            else:
+                sub['test_title'] = 'Unknown Test'
+                sub['pass_threshold'] = 60
             
-            return [
+            # Parse submitted_at if string
+            submitted_at = sub.get('submitted_at')
+            if isinstance(submitted_at, str):
+                submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+            
+            result.append(
                 TestSubmissionResponse(
                     id=str(sub['id']),
                     test_id=str(sub['test_id']),
                     test_title=sub['test_title'],
-                    participant_name=sub['participant_name'],
-                    participant_email=sub['participant_email'],
-                    score=float(sub['score']),
-                    total_questions=sub['total_questions'],
-                    correct_answers=sub['correct_answers'],
-                    time_taken_minutes=sub['time_taken_minutes'],
-                    is_passed=sub['score'] >= sub['pass_threshold'],
-                    submitted_at=sub['submitted_at']
+                    participant_name=sub.get('participant_name', 'Anonymous'),
+                    participant_email=sub.get('participant_email'),
+                    score=float(sub.get('score', 0)),
+                    total_questions=sub.get('total_questions', 0),
+                    correct_answers=sub.get('correct_answers', 0),
+                    time_taken_minutes=sub.get('time_taken_minutes'),
+                    is_passed=sub.get('score', 0) >= sub['pass_threshold'],
+                    submitted_at=submitted_at
                 )
-                for sub in submissions
-            ]
+            )
+        
+        return result
             
     except Exception as e:
         logger.error(f"Error fetching user attempts: {e}")
@@ -766,17 +820,15 @@ async def cancel_test_session(
     Cancel an active test session
     """
     try:
-        async with pool.acquire() as conn:
-            result = await conn.execute("""
-                UPDATE test_sessions 
-                SET is_active = false 
-                WHERE session_token = $1 AND is_active = true
-            """, session_token)
-            
-            if result == "UPDATE 0":
-                raise HTTPException(status_code=404, detail="Session not found or already inactive")
-            
-            return {"message": "Session cancelled successfully"}
+        # SUPABASE: Cancel test session
+        update_response = supabase.table('test_sessions').update({
+            'is_active': False
+        }).eq('session_token', session_token).eq('is_active', True).execute()
+        
+        if not update_response.data:
+            raise HTTPException(status_code=404, detail="Session not found or already inactive")
+        
+        return {"message": "Session cancelled successfully"}
             
     except HTTPException:
         raise
