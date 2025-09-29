@@ -185,7 +185,7 @@ async def create_public_link(
         link_response = await supabase.table('test_public_links').insert(link_data_to_insert).execute()
         
         if not link_response.data:
-            raise HTTPException(status_code=500, detail=\"Failed to create public link\")
+            raise HTTPException(status_code=500, detail="Failed to create public link")
         
         link_row = link_response.data[0]
         
@@ -194,7 +194,7 @@ async def create_public_link(
             test_id=str(link_row['test_id']),
             test_title=test_row['title'],
             link_token=link_row['link_token'],
-            public_url=f\"/test/public/{link_row['link_token']}\",
+            public_url=f"/test/public/{link_row['link_token']}",
             is_active=link_row.get('is_active', True),
             max_uses=link_row.get('max_uses'),
             current_uses=link_row.get('current_uses', 0),
